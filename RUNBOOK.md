@@ -321,6 +321,7 @@ was deleted between runs — restore it or run again to rebuild.
 | Symptom | Most likely cause | Fix |
 |---|---|---|
 | Setup notebook fails on `VALIDATE EXTERNAL LOCATION` | Azure RBAC not yet propagated | Wait 2–5 min, re-run |
+| `CREATE CATALOG` fails with `Metastore storage root URL does not exist` | Newer Databricks account; no default metastore storage root | Already handled in `03_catalog_schemas.sql` — the catalog is created with an explicit `MANAGED LOCATION` at the container root. Just re-run step 2.5. |
 | Bronze run produces 0 rows | Files not in the volume, or wrong path | `LIST '/Volumes/oos_portfolio/raw/landing_zone/'` |
 | Tier distribution looks like 90/10/0 or 0/0/100 | Threshold mismatch with currency/granularity | Re-check `TIER_T*_MIN_DAILY` in `pipeline_config.py` |
 | `trend_factor` is exactly 1.0 for everyone | Trend filter too aggressive (or 0-day window) | Inspect `sdf_trend` after the `.filter(isNotNull)` |

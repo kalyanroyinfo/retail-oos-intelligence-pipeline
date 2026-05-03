@@ -652,7 +652,11 @@ Run steps 3–8 below as one block:
 -- ──────────────────────────────────────────────────────────────────
 -- STEP 1: Create the catalog (top-level namespace)
 -- ──────────────────────────────────────────────────────────────────
+-- MANAGED LOCATION is required on newer Databricks accounts (no default
+-- metastore storage root). Pointing at the container root lets each
+-- schema's own MANAGED LOCATION nest underneath it.
 CREATE CATALOG IF NOT EXISTS oos_portfolio
+  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/'
   COMMENT 'Portfolio project: retail OOS detection pipeline (medallion architecture)';
 
 -- Set as default for this session

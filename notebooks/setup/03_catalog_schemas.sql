@@ -5,6 +5,12 @@
 
 -- COMMAND ----------
 
+-- The MANAGED LOCATION is required on workspaces where the metastore
+-- has no default storage root (newer Databricks accounts with "Default
+-- Storage" enabled).  Pointing at the container root lets each schema's
+-- own MANAGED LOCATION (landing/, bronze/, silver/, gold/) nest under
+-- it — a hard requirement: schema MLs must be subdirectories of the
+-- catalog ML.
 CREATE CATALOG IF NOT EXISTS oos_portfolio
   MANAGED LOCATION 'abfss://oos-portfolio@oosstorage.dfs.core.windows.net/'
   COMMENT 'Portfolio project: retail OOS detection pipeline (medallion architecture)';
