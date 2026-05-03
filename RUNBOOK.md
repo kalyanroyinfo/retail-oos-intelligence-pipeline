@@ -80,7 +80,7 @@ mv daily_files/* daily_files_bucketC/   # whatever's left = last day
 
 ### 1.4 Run the Streamlit dashboard (CSV demo mode)
 
-You need a `sample_kpi.csv` first — see Part 2 step 2.10 to export one
+You need a `sample_kpi.csv` first — see Part 2 step 2.11 to export one
 from Databricks. Once you have it:
 
 ```bash
@@ -126,44 +126,73 @@ Compute → Create cluster:
 
 Attach this cluster when running each notebook below.
 
-### 2.3 Edit two placeholders before the first run
+### 2.3 Edit Postgres placeholders (only if you'll push to Postgres)
 
-- `notebooks/setup/01_storage_credential.sql` line ~9 — replace
-  `<SUBSCRIPTION_ID>` with your real Azure subscription id.
-- `notebooks/config/pipeline_config.py` bottom — replace `PG_HOST`,
-  `PG_USER`, `PG_PASSWORD` placeholders, OR (preferred) create a secret
-  scope and the push notebook will pick those up automatically:
-  ```bash
-  databricks secrets create-scope oos
-  databricks secrets put-secret oos pg_user
-  databricks secrets put-secret oos pg_password
-  ```
+Edit `notebooks/config/pipeline_config.py` (bottom block) and replace
+`PG_HOST`, `PG_USER`, `PG_PASSWORD` — OR preferred — create a secret
+scope and the push notebook picks them up automatically:
 
-### 2.4 Run the one-time UC setup
+```bash
+databricks secrets create-scope oos
+databricks secrets put-secret oos pg_user
+databricks secrets put-secret oos pg_password
+```
+
+Skip this if you're not running step 2.10 yet.
+
+### 2.4 Create the storage credential MANUALLY via Catalog Explorer
+
+The credential `cred_oos_portfolio` is provisioned through the UI
+(metastore-admin gated), then the rest of the SQL setup runs against it.
+
+1. Open **Catalog Explorer** in the left nav
+2. Click **External Data** → **Storage Credentials** → **Create credential**
+3. Fill in:
+   - **Credential type:** `Azure Managed Identity`
+   - **Credential name:** `cred_oos_portfolio` *(must be exact — the
+     downstream notebooks reference it by this name)*
+   - **Access Connector ID:** the full Azure Resource ID — copy it from
+     the Access Connector's "Properties" page in Azure Portal. Format:
+     ```
+     /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/rg-oos-portfolio/providers/Microsoft.Databricks/accessConnectors/ac-oos-portfolio
+     ```
+4. Click **Create**.
+
+Verify the credential exists by running just the first cell of
+`notebooks/setup/01_storage_credential.sql` against your cluster — you
+should see one row in `SHOW STORAGE CREDENTIALS` and a `DESCRIBE` result
+with the connector ID you pasted. If `DESCRIBE` errors with "credential
+not found", the name doesn't match — recreate it as `cred_oos_portfolio`.
+
+### 2.5 Run the rest of the UC setup
 
 Open `notebooks/setup/00_run_all_setup.py` → **Run all**.
+
+Step 01 in the runner is verify-only (it just confirms the manual
+credential from 2.4 exists). Steps 02–05 run the SQL that creates the
+external location, catalog, schemas, and volume.
 
 Expected output:
 ```
 START storage_credential …
-END   storage_credential -> ...
+END   storage_credential -> ...    ← verifies cred_oos_portfolio exists
 START external_location …
 END   external_location -> ...
 START catalog_and_schemas …
 …
 ```
-And the cell finishes with `UC setup complete`.
+Last cell prints `UC setup complete`.
 
 If `02_external_location` fails with a permissions error, wait 2–5 minutes
-for Azure RBAC to propagate, then re-run just that step. The `IF NOT
-EXISTS` clauses make it safe to re-run.
+for Azure RBAC (Storage Blob Data Contributor) to propagate, then re-run
+just that step. The `IF NOT EXISTS` clauses make it safe to re-run.
 
 Verify in **Catalog Explorer**:
 - Catalog `oos_portfolio` exists
 - Schemas `raw`, `bronze`, `silver`, `gold` exist
 - Volume `oos_portfolio.raw.landing_zone` exists
 
-### 2.5 Upload Bucket A files to the volume
+### 2.6 Upload Bucket A files to the volume
 
 Easiest: **Catalog Explorer → oos_portfolio → raw → landing_zone → Upload**.
 Drag every file from `daily_files_bucketA/` into the upload dialog.
@@ -181,7 +210,7 @@ LIST '/Volumes/oos_portfolio/raw/landing_zone/'
 ```
 Should list ~303 CSV files.
 
-### 2.6 Run the Bronze notebook
+### 2.7 Run the Bronze notebook
 
 Open `notebooks/bronze/01_ingest_bronze_autoloader.py` → **Run all**
 (cluster attached).
@@ -196,7 +225,7 @@ FROM oos_portfolio.bronze.sales
 GROUP BY tbl_dt ORDER BY tbl_dt DESC LIMIT 10;
 ```
 
-### 2.7 Run Silver notebooks 02 → 06 in order
+### 2.8 Run Silver notebooks 02 → 06 in order
 
 Run each individually (cluster attached) so you can spot-check after each:
 
@@ -211,7 +240,7 @@ Run each individually (cluster attached) so you can spot-check after each:
 If any step fails, fix that one before moving on — every downstream step
 depends on the upstream tables.
 
-### 2.8 Run the Gold KPI notebook
+### 2.9 Run the Gold KPI notebook
 
 Open `notebooks/gold/07_compute_kpis.py` → **Run all**.
 
@@ -219,7 +248,7 @@ The notebook prints a headline summary table (n_products, n_oos, oos_rate,
 total_reorder_qty). Sanity values: ~3,941 products and `oos_rate` between
 0.20 and 0.30.
 
-### 2.9 (Optional) Push to PostgreSQL
+### 2.10 (Optional) Push to PostgreSQL
 
 Prereq: an Azure PostgreSQL Flexible Server is provisioned, the
 `portfolio.oos_agent_kpi` table is created (DDL in `README.md` Day 5), and
@@ -235,7 +264,7 @@ Verify from any Postgres client (psql, DBeaver, pgAdmin):
 SELECT COUNT(*), MAX(observation_date) FROM portfolio.oos_agent_kpi;
 ```
 
-### 2.10 Export sample CSV for the local Streamlit demo (optional)
+### 2.11 Export sample CSV for the local Streamlit demo (optional)
 
 If you want to run the dashboard locally without Postgres, export the
 gold table to a CSV from a Databricks notebook cell:
@@ -249,9 +278,9 @@ gold table to a CSV from a Databricks notebook cell:
 Then download via the Workspace UI (right-click the file → Download) and
 drop it at `dashboards/sample_kpi.csv` locally. Now Part 1 step 1.4 works.
 
-### 2.11 End-to-end smoke test (master orchestrator)
+### 2.12 End-to-end smoke test (master orchestrator)
 
-After steps 2.4 (setup) succeeded once, you don't run setup again. From
+After steps 2.4–2.5 (setup) succeeded once, you don't run setup again. From
 this point on, the entire daily pipeline is one notebook:
 
 Open `notebooks/00_run_full_pipeline.py` → **Run all**.
@@ -267,7 +296,7 @@ dbutils.notebook.run(
 Expected: 8 `START …` / `END …` log lines, finishing with
 `SUCCESS run_date=2026-05-03 env=dev`.
 
-### 2.12 Prove incremental ingestion (Auto Loader)
+### 2.13 Prove incremental ingestion (Auto Loader)
 
 This is the screenshot-worthy demo. After Bronze has run on Bucket A:
 

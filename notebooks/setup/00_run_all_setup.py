@@ -17,7 +17,10 @@ def run_step(name: str, path: str, timeout: int = 600) -> str:
 # COMMAND ----------
 
 # Strict dependency chain — DO NOT reorder.
-run_step("storage_credential",  "./01_storage_credential")    # admin
+# NOTE: step 01 is verify-only — the storage credential is created
+# manually via the Catalog Explorer UI (see 01_storage_credential.sql
+# header).  This step fast-fails if the credential is missing.
+run_step("storage_credential",  "./01_storage_credential")    # verify
 run_step("external_location",   "./02_external_location")     # admin (depends on #1)
 run_step("catalog_and_schemas", "./03_catalog_schemas")        # depends on #2
 run_step("landing_volume",      "./04_volume")                 # depends on #3

@@ -135,7 +135,7 @@ Run in order; each requires the previous to succeed.
 
 | # | Notebook | Purpose | Privilege required |
 |---|---|---|---|
-| 01 | `setup/01_storage_credential.sql` | `CREATE STORAGE CREDENTIAL cred_oos_portfolio` linking UC to the Azure Access Connector managed identity | **Metastore admin** |
+| 01 | `setup/01_storage_credential.sql` | **Verify-only.** The storage credential `cred_oos_portfolio` is created manually via Catalog Explorer → External Data → Storage Credentials. This notebook just runs `DESCRIBE STORAGE CREDENTIAL …` and fails fast if it's missing. | **Metastore admin** (for the manual UI step) |
 | 02 | `setup/02_external_location.sql` | `CREATE EXTERNAL LOCATION ext_lakehouse` at the `oos-portfolio` container root + `VALIDATE` | **Metastore admin** |
 | 03 | `setup/03_catalog_schemas.sql` | `CREATE CATALOG oos_portfolio` + 4 schemas (`raw`, `bronze`, `silver`, `gold`) each with `MANAGED LOCATION` | Catalog creator |
 | 04 | `setup/04_volume.sql` | `CREATE EXTERNAL VOLUME oos_portfolio.raw.landing_zone` pointing at `landing/uci_retail/` | Schema owner |
