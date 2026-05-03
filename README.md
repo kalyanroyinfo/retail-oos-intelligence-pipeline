@@ -85,6 +85,300 @@ After Day 4 you have **3 real incremental runs** to screenshot for the README.
 
 ---
 
+## Notebook Architecture & Master Orchestration
+
+### Notebook tree (final state)
+
+All notebooks live in your Databricks workspace under `/Workspace/Repos/<user>/azure-retail-oos-detection/notebooks/`. The same files live in your GitHub repo under `notebooks/`.
+
+```
+notebooks/
+├── 00_run_full_pipeline.py             ← MASTER orchestrator (daily ETL)
+│
+├── _setup/                             ← ONE-TIME admin setup (Day 2)
+│   ├── 00_run_all_setup.py             ← runs setup notebooks in order
+│   ├── 01_storage_credential.sql       ← UC → ADLS managed-identity link
+│   ├── 02_external_location.sql        ← register oos-portfolio container
+│   ├── 03_catalog_schemas.sql          ← catalog + 4 medallion schemas
+│   ├── 04_volume.sql                   ← landing_zone external volume
+│   └── 05_grants.sql                   ← (optional) permissions
+│
+├── _config/                            ← shared config used by all ETL nbs
+│   └── pipeline_config.py              ← paths, table names, thresholds
+│
+├── bronze/
+│   └── 01_ingest_bronze_autoloader.py
+├── silver/
+│   ├── 02_compute_history.py
+│   ├── 03_compute_agent_stats.py
+│   ├── 04_compute_forecast.py
+│   ├── 05_compute_backtest.py
+│   └── 06_compute_balance_snapshot.py
+├── gold/
+│   ├── 07_compute_kpis.py
+│   └── 08_push_to_postgres.py
+└── analysis/
+    └── Results_and_Analysis.ipynb      ← portfolio "proof of work" charts
+```
+
+### What each notebook does
+
+#### A. One-time setup notebooks (`_setup/`) — Day 2 only
+
+These run **once** per environment to provision Unity Catalog objects.
+Run in order; each requires the previous to succeed.
+
+| # | Notebook | Purpose | Privilege required |
+|---|---|---|---|
+| 01 | `_setup/01_storage_credential.sql` | `CREATE STORAGE CREDENTIAL cred_oos_portfolio` linking UC to the Azure Access Connector managed identity | **Metastore admin** |
+| 02 | `_setup/02_external_location.sql` | `CREATE EXTERNAL LOCATION ext_lakehouse` at the `oos-portfolio` container root + `VALIDATE` | **Metastore admin** |
+| 03 | `_setup/03_catalog_schemas.sql` | `CREATE CATALOG oos_portfolio` + 4 schemas (`raw`, `bronze`, `silver`, `gold`) each with `MANAGED LOCATION` | Catalog creator |
+| 04 | `_setup/04_volume.sql` | `CREATE EXTERNAL VOLUME oos_portfolio.raw.landing_zone` pointing at `landing/uci_retail/` | Schema owner |
+| 05 | `_setup/05_grants.sql` | (Optional) `GRANT USE CATALOG`, `READ VOLUME`, `SELECT ON SCHEMA gold` to `account users` | Object owner |
+| 00 | `_setup/00_run_all_setup.py` | Master setup runner — calls 01→05 sequentially via `dbutils.notebook.run` | Same as above |
+
+> ⚠️ **Run only once** — these are idempotent (`CREATE ... IF NOT EXISTS`) but should not be in the daily pipeline. ADF should NOT call them.
+
+#### B. Daily ETL notebooks (the actual pipeline)
+
+| # | Notebook | Layer | Purpose | Day built |
+|---|---|---|---|---|
+| 01 | `bronze/01_ingest_bronze_autoloader.py` | Bronze | Auto Loader: landing CSVs → `bronze.sales` Delta | Day 2 |
+| 02 | `silver/02_compute_history.py` | Silver | Daily sales aggregation per product | Day 3 |
+| 03 | `silver/03_compute_agent_stats.py` | Silver | Tier classification (T1/T2/T3) | Day 3 |
+| 04 | `silver/04_compute_forecast.py` | Silver | DOW + trend + monthly lift forecast | Day 3 |
+| 05 | `silver/05_compute_backtest.py` | Silver | Walk-forward backtest, WAPE, bias correction | Day 4 |
+| 06 | `silver/06_compute_balance_snapshot.py` | Silver | Simulated current balance per product | Day 4 |
+| 07 | `gold/07_compute_kpis.py` | Gold | Final OOS KPIs with corrected forecast | Day 5 |
+| 08 | `gold/08_push_to_postgres.py` | Gold | JDBC write to Azure PostgreSQL | Day 5 |
+| 00 | `00_run_full_pipeline.py` | Master | Orchestrates all 8 ETL notebooks in dependency order | Day 6 |
+
+#### C. Shared config + analysis
+
+| Notebook | Purpose | Day |
+|---|---|---|
+| `_config/pipeline_config.py` | Centralized constants: catalog name, table FQNs, thresholds, JDBC URL | Day 2 |
+| `analysis/Results_and_Analysis.ipynb` | Portfolio charts: WAPE histogram, forecast vs actual, OOS rate | Day 7 |
+
+### Master setup runner — `_setup/00_run_all_setup.py`
+
+Run this **once on Day 2** to provision all Unity Catalog objects. After it succeeds, you never run it again — daily ETL takes over.
+
+```python
+# notebooks/_setup/00_run_all_setup.py
+# One-time UC setup runner — calls 5 SQL/Python steps in dependency order.
+# Idempotent: every step uses CREATE ... IF NOT EXISTS.
+
+from datetime import datetime
+
+def run_step(name, path, timeout=600):
+    print(f"▶ START {name}  ({datetime.utcnow().isoformat()})")
+    result = dbutils.notebook.run(path, timeout)
+    print(f"✔ END   {name}  → {result}")
+    return result
+
+# Strict dependency chain — DO NOT reorder
+run_step("storage_credential",  "./01_storage_credential")    # admin
+run_step("external_location",   "./02_external_location")     # admin (depends on #1)
+run_step("catalog_and_schemas", "./03_catalog_schemas")       # depends on #2
+run_step("landing_volume",      "./04_volume")                # depends on #3
+run_step("grants",              "./05_grants")                # optional
+
+dbutils.notebook.exit("UC setup complete")
+```
+
+> **Note:** SQL notebooks return strings via `dbutils.notebook.exit('...')` only in Python notebooks. For pure `.sql` files, the master runner just executes them and checks for absence of errors. Alternatively, wrap each SQL block in a `.py` notebook using `spark.sql("""...""")` if you want richer return values.
+
+### Shared config — `_config/pipeline_config.py`
+
+Avoid hard-coding catalog names, table FQNs, or thresholds in every ETL notebook. Centralize them:
+
+```python
+# notebooks/_config/pipeline_config.py
+
+# ── Unity Catalog object names ───────────────────────────────────
+CATALOG = "oos_portfolio"
+RAW_SCHEMA    = f"{CATALOG}.raw"
+BRONZE_SCHEMA = f"{CATALOG}.bronze"
+SILVER_SCHEMA = f"{CATALOG}.silver"
+GOLD_SCHEMA   = f"{CATALOG}.gold"
+
+# Volume path (Auto Loader watches this)
+LANDING_VOLUME = f"/Volumes/{CATALOG}/raw/landing_zone"
+
+# ── Fully-qualified table names ──────────────────────────────────
+T_BRONZE_SALES        = f"{BRONZE_SCHEMA}.sales"
+T_SILVER_HISTORY      = f"{SILVER_SCHEMA}.oos_history"
+T_SILVER_AGENT_STATS  = f"{SILVER_SCHEMA}.agent_stats"
+T_SILVER_FORECAST     = f"{SILVER_SCHEMA}.oos_forecast"
+T_SILVER_ACCURACY     = f"{SILVER_SCHEMA}.oos_forecast_accuracy"
+T_SILVER_BALANCE      = f"{SILVER_SCHEMA}.oos_balance_snapshot"
+T_GOLD_KPI            = f"{GOLD_SCHEMA}.oos_agent_kpi"
+
+# ── Forecast model thresholds ────────────────────────────────────
+OOS_THRESHOLD_FLOOR     = 100   # currency floor
+OOS_THRESHOLD_REBAL     = 500
+OOS_THRESHOLD_DAYS      = 1.0
+TOPUP_BUFFER_DAYS       = 2.0
+TIER_T1_MIN_HOURLY      = 50
+TIER_T2_MIN_HOURLY      = 10
+WINSORIZE_PCT           = 0.95
+BIAS_CORRECTION_CLIP    = (0.5, 3.0)
+
+# ── Backtest ─────────────────────────────────────────────────────
+BACKTEST_DAYS           = 7
+TREND_WINDOW_DAYS       = 45
+```
+
+**Usage in any ETL notebook:**
+
+```python
+%run ../_config/pipeline_config
+
+sdf_history = spark.table(T_SILVER_HISTORY)
+```
+
+The `%run` magic command imports all variables from the config notebook into the current scope — clean, no circular imports, version-controlled in one place.
+
+### Master notebook — `00_run_full_pipeline.py`
+
+This is the **single entry point** for the daily ETL. ADF will call this one notebook (instead of orchestrating 8 separate notebook activities), which simplifies the ADF pipeline and keeps orchestration logic in code where it can be version-controlled.
+
+```python
+# notebooks/00_run_full_pipeline.py
+# Master orchestrator — runs the full Bronze → Silver → Gold pipeline
+# in dependency order. Each child notebook is a self-contained step.
+
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+# ── Pipeline parameters (override via ADF widgets) ───────────────
+dbutils.widgets.text("run_date",     str(datetime.utcnow().date()))
+dbutils.widgets.text("env",          "dev")
+dbutils.widgets.text("oos_threshold", "1.0")
+
+run_date      = dbutils.widgets.get("run_date")
+env           = dbutils.widgets.get("env")
+oos_threshold = dbutils.widgets.get("oos_threshold")
+
+common_params = {
+    "run_date":      run_date,
+    "env":           env,
+    "oos_threshold": oos_threshold,
+}
+
+# ── Helper: run a child notebook + log status ────────────────────
+def run_step(name, path, timeout=1800, params=None):
+    print(f"▶ START {name}  ({datetime.utcnow().isoformat()})")
+    result = dbutils.notebook.run(path, timeout, params or common_params)
+    print(f"✔ END   {name}  → {result}")
+    return result
+
+# ── STEP 1: Bronze (Auto Loader) ─────────────────────────────────
+run_step("bronze_autoloader", "./bronze/01_ingest_bronze_autoloader")
+
+# ── STEP 2: Silver — history must run first (forecast depends on it)
+run_step("silver_history",    "./silver/02_compute_history")
+
+# ── STEP 3: Silver — agent_stats + forecast can run in parallel
+with ThreadPoolExecutor(max_workers=2) as ex:
+    f_stats    = ex.submit(run_step, "silver_agent_stats", "./silver/03_compute_agent_stats")
+    f_forecast = ex.submit(run_step, "silver_forecast",    "./silver/04_compute_forecast")
+    f_stats.result(); f_forecast.result()
+
+# ── STEP 4: Silver — backtest depends on forecast; balance independent
+with ThreadPoolExecutor(max_workers=2) as ex:
+    f_back = ex.submit(run_step, "silver_backtest", "./silver/05_compute_backtest")
+    f_bal  = ex.submit(run_step, "silver_balance",  "./silver/06_compute_balance_snapshot")
+    f_back.result(); f_bal.result()
+
+# ── STEP 5: Gold KPIs (depends on all silver tables) ─────────────
+run_step("gold_kpis", "./gold/07_compute_kpis")
+
+# ── STEP 6: Push to PostgreSQL (final serving layer) ─────────────
+run_step("push_postgres", "./gold/08_push_to_postgres")
+
+# ── Pipeline summary ─────────────────────────────────────────────
+dbutils.notebook.exit(f"SUCCESS run_date={run_date} env={env}")
+```
+
+### Execution DAG (what actually runs in what order)
+
+```
+                  01_bronze_autoloader
+                         │
+                  02_compute_history
+                  ┌──────┴──────┐
+                  ▼             ▼
+        03_agent_stats    04_compute_forecast
+                  └──────┬──────┘
+                  ┌──────┴──────┐
+                  ▼             ▼
+        05_compute_backtest   06_balance_snapshot
+                  └──────┬──────┘
+                         ▼
+                   07_compute_kpis
+                         │
+                         ▼
+                   08_push_to_postgres
+```
+
+### Two orchestration options (pick one for Day 6)
+
+**Option A — Master notebook only** (simplest)
+- ADF pipeline has **1 activity**: "Run `00_run_full_pipeline`"
+- Orchestration logic lives in Python (versioned, tested, portable)
+- **Use this for the portfolio** — cleanest demo
+
+**Option B — ADF orchestrates each notebook**
+- ADF pipeline has **8 chained activities**, one per notebook
+- Visual DAG inside ADF — recruiters can see the dependency graph
+- More clicks but visually impressive on screenshots
+- Requires re-creating dependencies in ADF JSON
+
+**Recommended:** build Option A first (works in 30 min). If time on Day 6 permits, *also* build Option B for the screenshot.
+
+### Why a master notebook (vs raw ADF)
+
+1. **Faster iteration** — change orchestration logic by editing 1 Python file, no ADF redeploy.
+2. **Local-runnable** — you can test the full pipeline by running `00_run_full_pipeline` directly in Databricks without ADF.
+3. **Parametric** — widgets let you pass `run_date`, `env`, `oos_threshold` at runtime.
+4. **Parallelism** — `ThreadPoolExecutor` runs independent notebooks concurrently; ADF can't do this without complex parallel-activity setup.
+5. **Portable** — same pattern works in Databricks Workflows, ADF, or Airflow.
+
+### Each child notebook follows this template
+
+```python
+# notebooks/silver/04_compute_forecast.py
+# DOW + trend + monthly-lift forecast
+
+# ── Widgets (so master + ADF can pass parameters) ────────────────
+dbutils.widgets.text("run_date", "")
+dbutils.widgets.text("env",      "dev")
+run_date = dbutils.widgets.get("run_date")
+
+# ── Read upstream Silver table ───────────────────────────────────
+sdf_history = spark.table("oos_portfolio.silver.oos_history")
+
+# ── Transform (forecast logic here) ──────────────────────────────
+sdf_forecast = (sdf_history
+    # ... DOW median + trend + monthly factor ...
+)
+
+# ── Write downstream Silver table ────────────────────────────────
+(sdf_forecast.write
+    .format("delta")
+    .mode("overwrite")
+    .saveAsTable("oos_portfolio.silver.oos_forecast"))
+
+# ── Return value (visible in master orchestrator logs) ───────────
+dbutils.notebook.exit(f"forecast rows={sdf_forecast.count()} run_date={run_date}")
+```
+
+This template — widgets → read → transform → write → exit — keeps every child notebook **idempotent, parameterized, and self-contained**.
+
+---
+
 # DAY 1 — Foundation: Azure + GitHub + Bronze Upload
 
 **Time: 7–8 hrs**
@@ -125,12 +419,16 @@ After Day 4 you have **3 real incremental runs** to screenshot for the README.
 ## Afternoon (3 hrs) — Storage + Raw Data
 
 - [ ] Create ADLS Gen2 storage account (enable hierarchical namespace)
-- [ ] Create **1 container**: `lakehouse`
+- [ ] Create **1 container**: `oos-portfolio`
   - Industry standard for UC-governed setups: a single container holds all
     layers as folders, governance happens at UC layer (not container RBAC)
-  - Folder layout inside `lakehouse/`:
+  - **Azure naming rule:** container names allow only lowercase letters,
+    digits, and hyphens — **NO underscores**. So the container is
+    `oos-portfolio` (hyphens), while UC catalog/schema names use
+    `oos_portfolio` (underscores, since UC identifiers prefer underscores).
+  - Folder layout inside `oos-portfolio/`:
     ```
-    lakehouse/
+    oos-portfolio/
     ├── landing/uci_retail/      ← raw CSVs (UC volume)
     ├── bronze/                  ← UC managed schema location
     ├── silver/                  ← UC managed schema location
@@ -227,7 +525,7 @@ In Databricks → **Catalog Explorer** → **External Data**:
   2. **External Locations** → Create **ONE** location at the container root
      (covers all sub-folders: landing, bronze, silver, gold):
      - Name: `ext-lakehouse`
-     - URL: `abfss://lakehouse@<storage_account>.dfs.core.windows.net/`
+     - URL: `abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/`
      - Storage credential: `cred-oos-portfolio`
   3. Click **Test connection** — must pass before proceeding.
 
@@ -260,7 +558,7 @@ DESCRIBE STORAGE CREDENTIAL cred_oos_portfolio;
 -- Schemas and volumes created later will inherit access through this.
 
 CREATE EXTERNAL LOCATION ext_lakehouse
-  URL 'abfss://lakehouse@<storage_account>.dfs.core.windows.net/'
+  URL 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/'
   WITH (STORAGE CREDENTIAL cred_oos_portfolio)
   COMMENT 'Root external location for OOS lakehouse (all medallion layers)';
 
@@ -339,19 +637,19 @@ DESCRIBE CATALOG EXTENDED oos_portfolio;
 -- All managed tables created in a schema land under its managed location.
 
 CREATE SCHEMA IF NOT EXISTS oos_portfolio.raw
-  MANAGED LOCATION 'abfss://lakehouse@<storage_account>.dfs.core.windows.net/landing/'
+  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/landing/'
   COMMENT 'Landing zone: raw incoming files via Auto Loader';
 
 CREATE SCHEMA IF NOT EXISTS oos_portfolio.bronze
-  MANAGED LOCATION 'abfss://lakehouse@<storage_account>.dfs.core.windows.net/bronze/'
+  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/bronze/'
   COMMENT 'Bronze layer: ingested raw Delta tables';
 
 CREATE SCHEMA IF NOT EXISTS oos_portfolio.silver
-  MANAGED LOCATION 'abfss://lakehouse@<storage_account>.dfs.core.windows.net/silver/'
+  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/silver/'
   COMMENT 'Silver layer: cleaned + feature-engineered tables';
 
 CREATE SCHEMA IF NOT EXISTS oos_portfolio.gold
-  MANAGED LOCATION 'abfss://lakehouse@<storage_account>.dfs.core.windows.net/gold/'
+  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/gold/'
   COMMENT 'Gold layer: business KPI tables';
 
 -- Verify
@@ -366,7 +664,7 @@ DESCRIBE SCHEMA EXTENDED oos_portfolio.bronze;
 -- the UC-native way to manage files (CSVs, models, images, etc.).
 
 CREATE EXTERNAL VOLUME IF NOT EXISTS oos_portfolio.raw.landing_zone
-  LOCATION 'abfss://lakehouse@<storage_account>.dfs.core.windows.net/landing/uci_retail/'
+  LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/landing/uci_retail/'
   COMMENT 'Daily incoming UCI Online Retail CSV files';
 
 -- Verify
