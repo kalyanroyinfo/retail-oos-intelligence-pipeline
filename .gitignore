@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.python-version
+
+# Notebook artifacts
+.ipynb_checkpoints/
+
+# Data (raw + derived) — never commit
+daily_files/
+daily_files_bucketA/
+daily_files_bucketB/
+daily_files_bucketC/
+*.csv
+*.xlsx
+*.parquet
+
+# Local Spark / Delta artifacts
+spark-warehouse/
+metastore_db/
+derby.log
+_checkpoints/
+_schemas/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Secrets
+secrets.json
+*.pem
+*.key
+.databrickscfg
+.claude/*

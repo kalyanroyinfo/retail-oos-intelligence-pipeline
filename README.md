@@ -5,6 +5,11 @@
 **Total time:** ~45–55 hrs over 7 days (~6–8 hrs/day)
 **Budget:** ~$5–10 in Azure costs (uses free credits)
 
+> **Just want to run the code?** See [`RUNBOOK.md`](./RUNBOOK.md) for the
+> step-by-step execute-and-verify guide (local + Databricks). The
+> [Testing](#testing) section below covers the SQL queries to confirm
+> each layer is healthy.
+
 ---
 
 ## Repo Name Options
@@ -95,7 +100,7 @@ All notebooks live in your Databricks workspace under `/Workspace/Repos/<user>/a
 notebooks/
 ├── 00_run_full_pipeline.py             ← MASTER orchestrator (daily ETL)
 │
-├── _setup/                             ← ONE-TIME admin setup (Day 2)
+├── setup/                             ← ONE-TIME admin setup (Day 2)
 │   ├── 00_run_all_setup.py             ← runs setup notebooks in order
 │   ├── 01_storage_credential.sql       ← UC → ADLS managed-identity link
 │   ├── 02_external_location.sql        ← register oos-portfolio container
@@ -103,7 +108,7 @@ notebooks/
 │   ├── 04_volume.sql                   ← landing_zone external volume
 │   └── 05_grants.sql                   ← (optional) permissions
 │
-├── _config/                            ← shared config used by all ETL nbs
+├── config/                            ← shared config used by all ETL nbs
 │   └── pipeline_config.py              ← paths, table names, thresholds
 │
 ├── bronze/
@@ -123,19 +128,19 @@ notebooks/
 
 ### What each notebook does
 
-#### A. One-time setup notebooks (`_setup/`) — Day 2 only
+#### A. One-time setup notebooks (`setup/`) — Day 2 only
 
 These run **once** per environment to provision Unity Catalog objects.
 Run in order; each requires the previous to succeed.
 
 | # | Notebook | Purpose | Privilege required |
 |---|---|---|---|
-| 01 | `_setup/01_storage_credential.sql` | `CREATE STORAGE CREDENTIAL cred_oos_portfolio` linking UC to the Azure Access Connector managed identity | **Metastore admin** |
-| 02 | `_setup/02_external_location.sql` | `CREATE EXTERNAL LOCATION ext_lakehouse` at the `oos-portfolio` container root + `VALIDATE` | **Metastore admin** |
-| 03 | `_setup/03_catalog_schemas.sql` | `CREATE CATALOG oos_portfolio` + 4 schemas (`raw`, `bronze`, `silver`, `gold`) each with `MANAGED LOCATION` | Catalog creator |
-| 04 | `_setup/04_volume.sql` | `CREATE EXTERNAL VOLUME oos_portfolio.raw.landing_zone` pointing at `landing/uci_retail/` | Schema owner |
-| 05 | `_setup/05_grants.sql` | (Optional) `GRANT USE CATALOG`, `READ VOLUME`, `SELECT ON SCHEMA gold` to `account users` | Object owner |
-| 00 | `_setup/00_run_all_setup.py` | Master setup runner — calls 01→05 sequentially via `dbutils.notebook.run` | Same as above |
+| 01 | `setup/01_storage_credential.sql` | `CREATE STORAGE CREDENTIAL cred_oos_portfolio` linking UC to the Azure Access Connector managed identity | **Metastore admin** |
+| 02 | `setup/02_external_location.sql` | `CREATE EXTERNAL LOCATION ext_lakehouse` at the `oos-portfolio` container root + `VALIDATE` | **Metastore admin** |
+| 03 | `setup/03_catalog_schemas.sql` | `CREATE CATALOG oos_portfolio` + 4 schemas (`raw`, `bronze`, `silver`, `gold`) each with `MANAGED LOCATION` | Catalog creator |
+| 04 | `setup/04_volume.sql` | `CREATE EXTERNAL VOLUME oos_portfolio.raw.landing_zone` pointing at `landing/uci_retail/` | Schema owner |
+| 05 | `setup/05_grants.sql` | (Optional) `GRANT USE CATALOG`, `READ VOLUME`, `SELECT ON SCHEMA gold` to `account users` | Object owner |
+| 00 | `setup/00_run_all_setup.py` | Master setup runner — calls 01→05 sequentially via `dbutils.notebook.run` | Same as above |
 
 > ⚠️ **Run only once** — these are idempotent (`CREATE ... IF NOT EXISTS`) but should not be in the daily pipeline. ADF should NOT call them.
 
@@ -157,15 +162,15 @@ Run in order; each requires the previous to succeed.
 
 | Notebook | Purpose | Day |
 |---|---|---|
-| `_config/pipeline_config.py` | Centralized constants: catalog name, table FQNs, thresholds, JDBC URL | Day 2 |
+| `config/pipeline_config.py` | Centralized constants: catalog name, table FQNs, thresholds, JDBC URL | Day 2 |
 | `analysis/Results_and_Analysis.ipynb` | Portfolio charts: WAPE histogram, forecast vs actual, OOS rate | Day 7 |
 
-### Master setup runner — `_setup/00_run_all_setup.py`
+### Master setup runner — `setup/00_run_all_setup.py`
 
 Run this **once on Day 2** to provision all Unity Catalog objects. After it succeeds, you never run it again — daily ETL takes over.
 
 ```python
-# notebooks/_setup/00_run_all_setup.py
+# notebooks/setup/00_run_all_setup.py
 # One-time UC setup runner — calls 5 SQL/Python steps in dependency order.
 # Idempotent: every step uses CREATE ... IF NOT EXISTS.
 
@@ -189,12 +194,19 @@ dbutils.notebook.exit("UC setup complete")
 
 > **Note:** SQL notebooks return strings via `dbutils.notebook.exit('...')` only in Python notebooks. For pure `.sql` files, the master runner just executes them and checks for absence of errors. Alternatively, wrap each SQL block in a `.py` notebook using `spark.sql("""...""")` if you want richer return values.
 
-### Shared config — `_config/pipeline_config.py`
+### Shared config — `config/pipeline_config.py`
 
-Avoid hard-coding catalog names, table FQNs, or thresholds in every ETL notebook. Centralize them:
+Avoid hard-coding catalog names, table FQNs, or thresholds in every ETL notebook. Centralize them.
+
+> **Why these values?** The thresholds below are calibrated against actual UCI
+> Online Retail percentiles (median daily sales £14.22, p25 £7.50, p75 £26.86,
+> p95 £79, ~3,941 products, ~305 days). Earlier drafts ported numbers from a
+> Zambian mobile-money agent use case (ZMW currency, hourly granularity); those
+> values produced nonsensical OOS rates and tier splits on retail data.
 
 ```python
-# notebooks/_config/pipeline_config.py
+# notebooks/config/pipeline_config.py
+# Calibrated for UCI Online Retail (GBP, daily granularity, ~3,941 products)
 
 # ── Unity Catalog object names ───────────────────────────────────
 CATALOG = "oos_portfolio"
@@ -215,25 +227,46 @@ T_SILVER_ACCURACY     = f"{SILVER_SCHEMA}.oos_forecast_accuracy"
 T_SILVER_BALANCE      = f"{SILVER_SCHEMA}.oos_balance_snapshot"
 T_GOLD_KPI            = f"{GOLD_SCHEMA}.oos_agent_kpi"
 
-# ── Forecast model thresholds ────────────────────────────────────
-OOS_THRESHOLD_FLOOR     = 100   # currency floor
-OOS_THRESHOLD_REBAL     = 500
-OOS_THRESHOLD_DAYS      = 1.0
-TOPUP_BUFFER_DAYS       = 2.0
-TIER_T1_MIN_HOURLY      = 50
-TIER_T2_MIN_HOURLY      = 10
-WINSORIZE_PCT           = 0.95
+# ── OOS thresholds ───────────────────────────────────────────────
+OOS_THRESHOLD_FLOOR     = 5      # £ floor — ≈ p25 daily sales
+OOS_THRESHOLD_DAYS      = 1.0    # threshold = max(floor, forecast × this)
+TOPUP_BUFFER_DAYS       = 2.0    # restock target covers this many forecast days
+# (No OOS_THRESHOLD_REBAL — no rebalancer concept in retail)
+
+# ── Product tiers (DAILY revenue, not hourly) ────────────────────
+TIER_T1_MIN_DAILY       = 30     # £/day → ~22% T1
+TIER_T2_MIN_DAILY       = 8      # £/day → ~38% T2  (T3 = remainder ~40%)
+
+# ── Forecast scale-factor clip per tier ──────────────────────────
+SCALE_CLIP_T1           = (0.5, 5.0)   # T1: most volatile, widest clip
+SCALE_CLIP_T2           = (0.5, 3.0)
+SCALE_CLIP_T3           = (0.5, 1.5)   # T3: tight clip (low-volume noise)
+
+# ── Outlier handling ─────────────────────────────────────────────
+WINSORIZE_PCT           = 0.95   # p95 cap on extreme daily sales
 BIAS_CORRECTION_CLIP    = (0.5, 3.0)
 
 # ── Backtest ─────────────────────────────────────────────────────
 BACKTEST_DAYS           = 7
-TREND_WINDOW_DAYS       = 45
+TREND_WINDOW_DAYS       = 45     # UCI dataset is ~305 days; OK
+COLD_START_DAYS         = 7
+COLD_START_BUFFER       = 1.1
+
+# ── Balance simulation (UCI has no real inventory data) ──────────
+BALANCE_SIM_LOOKBACK    = 3      # days of recent sales to base "balance" on
+BALANCE_SIM_MULT_LOW    = 0.3
+BALANCE_SIM_MULT_HIGH   = 1.5    # → ~25% OOS rate
+BALANCE_SIM_SEED        = 42
+
+# ── Currency / display ───────────────────────────────────────────
+CURRENCY_SYMBOL         = "£"
+CURRENCY_CODE           = "GBP"
 ```
 
 **Usage in any ETL notebook:**
 
 ```python
-%run ../_config/pipeline_config
+%run ../config/pipeline_config
 
 sdf_history = spark.table(T_SILVER_HISTORY)
 ```
@@ -801,19 +834,23 @@ populated with ~300 days of historical data.
 
 - [ ] Write `etl/silver/compute_agent_stats.py`:
   - Compute `avg_daily_sales` per `StockCode` over full history
-  - Assign tier:
-    - **T1-Gold**: avg_daily_sales ≥ 50
-    - **T2-Silver**: 10 ≤ avg_daily_sales < 50
-    - **T3-Bronze**: avg_daily_sales < 10
-  - (Adjust thresholds to match dataset scale — the UCI dataset is in GBP)
+  - Assign tier (uses `TIER_T1_MIN_DAILY` / `TIER_T2_MIN_DAILY` from config):
+    - **T1-Gold**: avg_daily_sales ≥ £30
+    - **T2-Silver**: £8 ≤ avg_daily_sales < £30
+    - **T3-Bronze**: avg_daily_sales < £8
+  - Thresholds are calibrated against UCI percentiles (median £14.22 / p25 £7.50 / p75 £26.86)
   - Write to `oos_portfolio.silver.agent_stats` Delta
-- [ ] Print tier distribution; aim for ~20% T1, ~30% T2, ~50% T3
+- [ ] Print tier distribution; expect ~22% T1, ~38% T2, ~40% T3
 
 ## Afternoon (3 hrs) — Forecast Model
 
 - [ ] Write `etl/silver/compute_forecast.py`:
   - **DOW median**: `groupBy(StockCode, day_of_week).agg(F.expr("percentile_approx(daily_sales, 0.5)"))`
-  - **45-day OLS trend slope** per product (use Spark window or pandas UDF on small grouped data)
+  - **45-day OLS trend** per product via Spark SQL aggregates (no UDF, no window):
+    - `slope = covar_pop(days_ago, daily_sales) / var_pop(days_ago)`
+    - `projected_today = trend_avg − slope × avg(days_ago)`  (exact OLS intercept at days_ago=0)
+    - `trend_factor = clip(projected_today / overall_median, per-tier ranges)`
+    - Products with <2 distinct days → NULL slope → fall back to `trend_factor = 1.0`
   - **Monthly lift factor**: current month median / overall median
   - **Forecast formula**: `forecast = max(dow_median × trend_factor × month_factor, 0)`
   - Write to `oos_portfolio.silver.oos_forecast` Delta
@@ -877,13 +914,15 @@ populated with ~300 days of historical data.
   - Join: `balance_snapshot ⨝ forecast ⨝ accuracy ⨝ agent_stats`
   - Apply bias correction: `corrected_forecast = forecast × bias_correction`
   - Compute KPIs:
-    - `oos_threshold = max(100, corrected_forecast × 1.0)`
+    - `oos_threshold = max(OOS_THRESHOLD_FLOOR, corrected_forecast × OOS_THRESHOLD_DAYS)`
+      (i.e. `max(£5, corrected_forecast × 1.0)` — £5 ≈ p25 daily sales)
     - `is_oos = current_balance < oos_threshold`
-    - `float_required = ceil(max(corrected_forecast × 2.0 - current_balance, 0))`
-    - `balance_color`:
-      - GREEN: `current_balance ≥ 500`
-      - AMBER: `100 ≤ current_balance < 500`
-      - RED: `current_balance < 100`
+    - `reorder_qty = ceil(max(corrected_forecast × 2.0 - current_balance, 0))`
+      (units to add so on-hand covers `TOPUP_BUFFER_DAYS` of forecast demand)
+    - `balance_color` (rough bands — balance ≈ ~3 days of sales):
+      - GREEN: `current_balance ≥ £80`
+      - AMBER: `£25 ≤ current_balance < £80`
+      - RED: `current_balance < £25`
   - Write to `oos_portfolio.gold.oos_agent_kpi` Delta
 - [ ] Verify: OOS rate (~20–30%), tier breakdown, threshold distribution sensible
 
@@ -902,7 +941,7 @@ populated with ~300 days of historical data.
       corrected_forecast DECIMAL(12,2),
       oos_threshold DECIMAL(12,2),
       is_oos BOOLEAN,
-      float_required DECIMAL(12,2),
+      reorder_qty DECIMAL(12,2),
       balance_color VARCHAR(10),
       wape DECIMAL(5,2),
       observation_date DATE,
@@ -959,10 +998,10 @@ populated with ~300 days of historical data.
 - [ ] Build **2 pages** (compressed scope):
 
   **Page 1: OOS Overview**
-  - KPI cards: total products, OOS count, OOS %, total float required
+  - KPI cards: total products, OOS count, OOS %, total reorder qty
   - Bar chart: OOS count by tier (T1/T2/T3)
   - Map: OOS rate by Country
-  - Table: top-20 products by `float_required`
+  - Table: top-20 products by `reorder_qty`
 
   **Page 2: Forecast Accuracy**
   - WAPE histogram
@@ -1029,6 +1068,126 @@ populated with ~300 days of historical data.
 - [ ] *(Optional, do tomorrow — not Day 7)* Draft LinkedIn post
 
 **End of Day 7 deliverable:** Public GitHub repo + live dashboard + CV entry. ✅
+
+---
+
+## Testing
+
+How to verify each layer is healthy. Run these in order — earlier failures cascade.
+
+### 1. Local unit tests (no Databricks needed)
+
+The forecast math has a few invariants we can pin down with pure Python:
+
+```bash
+pip install -r requirements.txt
+pytest tests/ -v
+```
+
+`tests/test_forecast.py` covers DOW-median behaviour, the OOS-threshold floor,
+and the bias-correction clip. Three checks, all should pass in <1s.
+
+### 2. Per-stage validation on Databricks
+
+After running each notebook, paste these into a SQL cell. Expected ranges
+are calibrated for UCI Online Retail.
+
+**Bronze — `01_ingest_bronze_autoloader`**
+```sql
+SELECT tbl_dt, COUNT(*) AS rows,
+       COUNT(DISTINCT source_file) AS files,
+       MAX(ingested_at) AS latest_ingestion
+FROM oos_portfolio.bronze.sales
+GROUP BY tbl_dt ORDER BY tbl_dt DESC LIMIT 10;
+```
+Expect: one row per day; `latest_ingestion` advances only on partitions touched
+by the current run (this is the proof of incremental ingestion).
+
+**Silver — history (`02_compute_history`)**
+```sql
+SELECT COUNT(*) AS rows, COUNT(DISTINCT StockCode) AS products,
+       MIN(tbl_dt) AS first_dt, MAX(tbl_dt) AS last_dt
+FROM oos_portfolio.silver.oos_history;
+```
+Expect: ~3,941 products, ~305 days.
+
+**Silver — agent_stats (`03_compute_agent_stats`)** — tier distribution
+```sql
+SELECT tier, COUNT(*) AS n,
+       ROUND(AVG(avg_daily_sales), 2) AS avg_£
+FROM oos_portfolio.silver.agent_stats
+GROUP BY tier ORDER BY tier;
+```
+Expect roughly **T1 ~22% / T2 ~38% / T3 ~40%**. Wildly different splits ⇒
+`TIER_T*_MIN_DAILY` thresholds in `pipeline_config.py` need re-tuning.
+
+**Silver — forecast (`04_compute_forecast`)** — trend factor sanity
+```sql
+SELECT tier,
+       percentile_approx(trend_factor, array(0.1, 0.5, 0.9)) AS p10_p50_p90,
+       SUM(CASE WHEN trend_factor = 1.0 THEN 1 ELSE 0 END) AS n_fallback,
+       COUNT(*) AS n_rows
+FROM oos_portfolio.silver.oos_forecast
+GROUP BY tier ORDER BY tier;
+```
+Expect: p50 close to 1.0; T3 has the most `n_fallback=1.0` rows (sparse
+products with <2 distinct active days fall back via NULL slope).
+
+**Silver — backtest (`05_compute_backtest`)** — accuracy
+```sql
+SELECT percentile_approx(wape, array(0.25, 0.5, 0.75)) AS wape_quartiles,
+       AVG(CAST((wape < 0.5) AS INT))                  AS pct_under_50,
+       COUNT(*)                                        AS n_products
+FROM oos_portfolio.silver.oos_forecast_accuracy;
+```
+Expect: median WAPE in 0.3–0.6 (UCI is volatile); ≥50% of products under 50% WAPE.
+
+**Gold — KPIs (`07_compute_kpis`)** — headline OOS metrics
+```sql
+SELECT COUNT(*)                                            AS n_products,
+       SUM(CASE WHEN is_oos THEN 1 ELSE 0 END)             AS n_oos,
+       ROUND(AVG(CASE WHEN is_oos THEN 1.0 ELSE 0.0 END), 3) AS oos_rate,
+       SUM(reorder_qty)                                    AS total_reorder_qty
+FROM oos_portfolio.gold.oos_agent_kpi;
+```
+Expect: `oos_rate` ~0.20–0.30 (driven by `BALANCE_SIM_MULT_LOW/HIGH = 0.3 / 1.5`).
+If it's near 0 or near 1, the simulation multiplier is mis-tuned.
+
+**Postgres — push (`08_push_to_postgres`)**
+```sql
+SELECT COUNT(*), MAX(observation_date) FROM portfolio.oos_agent_kpi;
+SELECT * FROM portfolio.oos_agent_kpi WHERE is_oos LIMIT 10;
+```
+Row count must equal the gold table; if it's smaller, JDBC silently dropped
+rows (usually an SSL/firewall hiccup).
+
+### 3. End-to-end smoke test
+
+Run the master orchestrator from a notebook cell:
+
+```python
+dbutils.notebook.run(
+    "./00_run_full_pipeline", 1800,
+    {"run_date": "2026-05-03", "env": "dev"}
+)
+```
+
+Healthy run prints `START … / END … -> …` for all eight steps and exits
+with `SUCCESS run_date=… env=dev`.
+
+### 4. Auto Loader incremental-ingestion proof
+
+This is the screenshot recruiters look for. After each daily-file drop:
+
+```sql
+SELECT tbl_dt, COUNT(*) AS rows, MAX(ingested_at) AS latest_ingestion
+FROM oos_portfolio.bronze.sales
+GROUP BY tbl_dt ORDER BY tbl_dt DESC;
+```
+
+Only the **new** `tbl_dt` should have a newer `latest_ingestion`. If older
+partitions also re-ingest, the checkpoint is mis-configured (most often the
+`_checkpoints` folder was deleted between runs).
 
 ---
 
