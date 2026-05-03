@@ -214,11 +214,16 @@ UC needs a way to access ADLS. This is a **one-time setup**.
     --role "Storage Blob Data Contributor" \
     --scope /subscriptions/<sub>/resourceGroups/rg-oos-portfolio/providers/Microsoft.Storage/storageAccounts/<storage>
   ```
-- [ ] In Databricks UI → **Catalog Explorer** → **External Data**:
+- [ ] Create Storage Credential + External Location — pick **either** Option A (UI) **or** Option B (SQL). Both produce the same result. After this completes, continue to **Part C** to create catalog → schemas → volume.
+
+### Option A — Databricks UI (point-and-click)
+
+In Databricks → **Catalog Explorer** → **External Data**:
   1. **Storage Credentials** → Create:
      - Name: `cred-oos-portfolio`
      - Type: Azure Managed Identity
-     - Access Connector ID: paste resource ID from Azure portal
+     - Access Connector ID: paste **resource ID** from Azure portal
+       (format: `/subscriptions/<sub>/resourceGroups/rg-oos-portfolio/providers/Microsoft.Databricks/accessConnectors/ac-oos-portfolio`)
   2. **External Locations** → Create **ONE** location at the container root
      (covers all sub-folders: landing, bronze, silver, gold):
      - Name: `ext-lakehouse`
@@ -226,14 +231,91 @@ UC needs a way to access ADLS. This is a **one-time setup**.
      - Storage credential: `cred-oos-portfolio`
   3. Click **Test connection** — must pass before proceeding.
 
+### Option B — SQL (run in a Databricks SQL editor or notebook)
+
+> ⚠️ **Privilege required:** you must be a **metastore admin** to run `CREATE STORAGE CREDENTIAL` and `CREATE EXTERNAL LOCATION`. Account admins can grant this via Account Console → Metastores.
+
+```sql
+-- ──────────────────────────────────────────────────────────────────
+-- 1. Create the storage credential (links UC to the Access Connector)
+-- ──────────────────────────────────────────────────────────────────
+-- Replace <sub>, resource group, and connector name with your actual values.
+-- The full resource ID can be copied from the Access Connector's Azure
+-- portal "Properties" page → "Resource ID".
+
+CREATE STORAGE CREDENTIAL cred_oos_portfolio
+  WITH AZURE_MANAGED_IDENTITY
+       '/subscriptions/<sub>/resourceGroups/rg-oos-portfolio/providers/Microsoft.Databricks/accessConnectors/ac-oos-portfolio'
+  COMMENT 'Managed identity used by UC to access the lakehouse container';
+
+-- Verify
+SHOW STORAGE CREDENTIALS;
+DESCRIBE STORAGE CREDENTIAL cred_oos_portfolio;
+
+
+-- ──────────────────────────────────────────────────────────────────
+-- 2. Create the external location at the container root
+-- ──────────────────────────────────────────────────────────────────
+-- One location covers all sub-folders (landing/, bronze/, silver/, gold/).
+-- Schemas and volumes created later will inherit access through this.
+
+CREATE EXTERNAL LOCATION ext_lakehouse
+  URL 'abfss://lakehouse@<storage_account>.dfs.core.windows.net/'
+  WITH (STORAGE CREDENTIAL cred_oos_portfolio)
+  COMMENT 'Root external location for OOS lakehouse (all medallion layers)';
+
+-- Verify path is reachable + permissions are correct
+-- (equivalent to clicking "Test connection" in the UI)
+VALIDATE EXTERNAL LOCATION ext_lakehouse;
+
+-- Inspect
+SHOW EXTERNAL LOCATIONS;
+DESCRIBE EXTERNAL LOCATION ext_lakehouse;
+
+
+-- ──────────────────────────────────────────────────────────────────
+-- 3. (Optional) Grant your user/group access to use this location
+-- ──────────────────────────────────────────────────────────────────
+-- Needed if you want a non-admin to create schemas/tables under it.
+
+GRANT CREATE EXTERNAL TABLE  ON EXTERNAL LOCATION ext_lakehouse TO `account users`;
+GRANT CREATE MANAGED STORAGE ON EXTERNAL LOCATION ext_lakehouse TO `account users`;
+GRANT READ FILES             ON EXTERNAL LOCATION ext_lakehouse TO `account users`;
+GRANT WRITE FILES            ON EXTERNAL LOCATION ext_lakehouse TO `account users`;
+```
+
+> 💡 **Tip:** if `VALIDATE EXTERNAL LOCATION` fails, the most common cause is the RBAC role (Storage Blob Data Contributor) hasn't propagated yet — wait 2–5 minutes and re-run.
+
 ## Morning Part C (1 hr) — Create Catalog, Schemas, Volume (full SQL)
 
-Run all of this in a Databricks SQL editor or notebook. Replace
-`<storage_account>` with your actual ADLS account name.
+Run all of this in a Databricks SQL editor or notebook **after** Part B SQL
+has succeeded. Replace `<storage_account>` with your actual ADLS account name.
 
-> 💡 **Pattern:** one external location at the container root, then each
+> 💡 **Pattern:** one external location at the container root (Part B), then each
 > schema gets its own MANAGED LOCATION pointing to a sub-folder. UC
 > automatically writes managed tables under that location.
+
+### Full UC setup dependency chain (Part B → Part C)
+
+The complete bottom-up order — each step depends on the previous:
+
+```
+1. CREATE STORAGE CREDENTIAL cred_oos_portfolio        ← Part B
+        ↓ (consumed by)
+2. CREATE EXTERNAL LOCATION ext_lakehouse              ← Part B
+        ↓ (parent path of all schemas + volumes below)
+3. CREATE CATALOG oos_portfolio                        ← Part C below
+        ↓
+4. CREATE SCHEMA oos_portfolio.raw     (MANAGED LOCATION → /landing/)
+5. CREATE SCHEMA oos_portfolio.bronze  (MANAGED LOCATION → /bronze/)
+6. CREATE SCHEMA oos_portfolio.silver  (MANAGED LOCATION → /silver/)
+7. CREATE SCHEMA oos_portfolio.gold    (MANAGED LOCATION → /gold/)
+        ↓
+8. CREATE EXTERNAL VOLUME oos_portfolio.raw.landing_zone
+   (LOCATION → /landing/uci_retail/)
+```
+
+Run steps 3–8 below as one block:
 
 ```sql
 -- ──────────────────────────────────────────────────────────────────
