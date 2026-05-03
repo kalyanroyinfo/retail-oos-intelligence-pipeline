@@ -12,9 +12,11 @@ CREATE EXTERNAL LOCATION IF NOT EXISTS ext_lakehouse
 
 -- COMMAND ----------
 
--- Equivalent to clicking "Test connection" in the UI.
--- If this fails with a permissions error, wait 2-5 minutes for RBAC to propagate then re-run.
-VALIDATE EXTERNAL LOCATION ext_lakehouse;
+-- Validation is only available through the UI (Test connection button) or REST API.
+-- There is no VALIDATE EXTERNAL LOCATION SQL command in Databricks SQL.
+-- If you need to test the connection, use: DESCRIBE EXTERNAL LOCATION ext_lakehouse;
+
+DESCRIBE EXTERNAL LOCATION ext_lakehouse;
 
 -- COMMAND ----------
 

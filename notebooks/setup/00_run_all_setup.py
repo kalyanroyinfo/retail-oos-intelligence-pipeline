@@ -20,11 +20,20 @@ def run_step(name: str, path: str, timeout: int = 600) -> str:
 # NOTE: step 01 is verify-only — the storage credential is created
 # manually via the Catalog Explorer UI (see 01_storage_credential.sql
 # header).  This step fast-fails if the credential is missing.
-run_step("storage_credential",  "./01_storage_credential")    # verify
-run_step("external_location",   "./02_external_location")     # admin (depends on #1)
-run_step("catalog_and_schemas", "./03_catalog_schemas")        # depends on #2
-run_step("landing_volume",      "./04_volume")                 # depends on #3
-#run_step("grants",              "./05_grants")                 # optional
+try:
+    run_step("storage_credential",  "./01_storage_credential")    # verify
+    run_step("external_location",   "./02_external_location")     # admin (depends on #1)
+    run_step("catalog_and_schemas", "./03_catalog_schemas")        # depends on #2
+    run_step("landing_volume",      "./04_volume")                 # depends on #3
+    #run_step("grants",              "./05_grants")                 # optional
+except Exception as e:
+    error_msg = str(e)
+    print(f"\n❌ Setup failed. Check the error above for details.")
+    print(f"\nCommon causes:")
+    print(f"  • Storage credential 'cred_oos_portfolio' not created in UI yet")
+    print(f"  • Missing METASTORE ADMIN privileges")
+    print(f"  • RBAC permissions still propagating (wait 2-5 minutes)")
+    raise
 
 # COMMAND ----------
 

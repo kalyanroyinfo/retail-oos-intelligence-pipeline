@@ -6,6 +6,7 @@
 -- COMMAND ----------
 
 CREATE CATALOG IF NOT EXISTS oos_portfolio
+  MANAGED LOCATION 'abfss://oos-portfolio@oosstorage.dfs.core.windows.net/'
   COMMENT 'Portfolio project: retail OOS detection pipeline (medallion architecture)';
 
 USE CATALOG oos_portfolio;
