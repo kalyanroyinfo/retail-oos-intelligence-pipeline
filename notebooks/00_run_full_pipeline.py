@@ -10,11 +10,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 # COMMAND ----------
 
-dbutils.widgets.text("run_date",     str(datetime.utcnow().date()))
+_today = str(datetime.utcnow().date())
+dbutils.widgets.text("run_date",     _today)
 dbutils.widgets.text("env",          "dev")
 dbutils.widgets.text("secret_scope", "oos")
 
-run_date     = dbutils.widgets.get("run_date")
+run_date     = dbutils.widgets.get("run_date") or _today
 env          = dbutils.widgets.get("env")
 secret_scope = dbutils.widgets.get("secret_scope")
 

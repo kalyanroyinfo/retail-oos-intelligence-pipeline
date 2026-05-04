@@ -13,10 +13,12 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("run_date", "")
-dbutils.widgets.text("env", "dev")
+from datetime import datetime
+_today = str(datetime.utcnow().date())
+dbutils.widgets.text("run_date",     _today)
+dbutils.widgets.text("env",          "dev")
 dbutils.widgets.text("secret_scope", "oos")
-run_date     = dbutils.widgets.get("run_date")
+run_date     = dbutils.widgets.get("run_date") or _today
 secret_scope = dbutils.widgets.get("secret_scope")
 
 # COMMAND ----------
