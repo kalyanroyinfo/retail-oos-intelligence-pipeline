@@ -71,10 +71,12 @@ BALANCE_AMBER_MIN       = 25     # £
 CURRENCY_SYMBOL         = "£"
 CURRENCY_CODE           = "GBP"
 
-# ── PostgreSQL serving layer (override via Databricks secret scope) ──
+# ── Azure SQL Database serving layer (override via Databricks secret scope) ──
 # Keep placeholders here — real values come from a secret scope at runtime.
-PG_HOST     = "REPLACE_ME.postgres.database.azure.com"
-PG_DB       = "postgres"
-PG_TABLE    = "portfolio.oos_agent_kpi"
-PG_USER     = "REPLACE_ME"          # prefer dbutils.secrets.get(...)
-PG_PASSWORD = "REPLACE_ME"          # prefer dbutils.secrets.get(...)
+# Tables in SQL Server live in a schema (default `dbo`), so the table is
+# qualified as `dbo.oos_agent_kpi` within the `oos_portfolio` database.
+AZSQL_HOST     = "REPLACE_ME.database.windows.net"
+AZSQL_DB       = "oos_portfolio"
+AZSQL_TABLE    = "dbo.oos_agent_kpi"
+AZSQL_USER     = "REPLACE_ME"        # prefer dbutils.secrets.get(...)
+AZSQL_PASSWORD = "REPLACE_ME"        # prefer dbutils.secrets.get(...)

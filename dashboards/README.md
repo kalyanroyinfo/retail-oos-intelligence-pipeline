@@ -7,20 +7,20 @@ share tier + country filters in the sidebar.
 ## Files
 
 - `streamlit_app.py` — the app
-- `requirements.txt` — Python deps (streamlit, pandas, plotly, sqlalchemy, psycopg2-binary)
+- `requirements.txt` — Python deps (streamlit, pandas, plotly, sqlalchemy, pymssql)
 - `sample_kpi.csv` — *not committed*; you create this on demand for demo mode
 
-## Run locally — Postgres mode (production layout)
+## Run locally — Azure SQL mode (production layout)
 
-Reads `portfolio.oos_agent_kpi` directly from Azure PostgreSQL.
+Reads `oos_portfolio.dbo.oos_agent_kpi` directly from Azure SQL Database.
 
 ```bash
 pip install -r dashboards/requirements.txt
 
-export PG_HOST=<your-server>.postgres.database.azure.com
-export PG_DB=postgres
-export PG_USER=<user>
-export PG_PASSWORD=<password>
+export AZSQL_HOST=<your-server>.database.windows.net
+export AZSQL_DB=oos_portfolio
+export AZSQL_USER=<user>
+export AZSQL_PASSWORD=<password>
 
 streamlit run dashboards/streamlit_app.py
 ```
@@ -28,10 +28,10 @@ streamlit run dashboards/streamlit_app.py
 App opens at <http://localhost:8501>. Data is cached for 10 minutes;
 rerun to refresh.
 
-## Run locally — CSV demo mode (no Postgres)
+## Run locally — CSV demo mode (no Azure SQL)
 
-Use this when Postgres isn't provisioned yet. Export the gold table from
-Databricks once, then point the app at the CSV.
+Use this when Azure SQL isn't provisioned yet. Export the gold table
+from Databricks once, then point the app at the CSV.
 
 In a Databricks notebook:
 
@@ -54,7 +54,7 @@ streamlit run dashboards/streamlit_app.py
 1. Push the repo to GitHub.
 2. Sign in at <https://share.streamlit.io> with the same GitHub account.
 3. **New app** → pick the repo, branch `main`, main file `dashboards/streamlit_app.py`.
-4. **Advanced settings → Secrets**: add the `PG_*` env vars.
+4. **Advanced settings → Secrets**: add the `AZSQL_*` env vars.
    (For the demo path, set `OOS_DATA_SOURCE=csv` and commit a sanitised
    `sample_kpi.csv` so the public app has data to render.)
 5. Deploy. URL pattern: `https://<your-handle>-<repo>-<hash>.streamlit.app`.

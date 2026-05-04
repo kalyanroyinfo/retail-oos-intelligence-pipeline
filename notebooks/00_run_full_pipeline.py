@@ -56,8 +56,8 @@ with ThreadPoolExecutor(max_workers=2) as ex:
 # STEP 5 — Gold KPIs (needs all silver tables).
 run_step("gold_kpis", "./gold/07_compute_kpis")
 
-# STEP 6 — Push to PostgreSQL (final serving layer).
-run_step("push_postgres", "./gold/08_push_to_postgres")
+# STEP 6 — Push to Azure SQL Database (final serving layer).
+run_step("push_azure_sql", "./gold/08_push_to_azure_sql")
 
 # COMMAND ----------
 

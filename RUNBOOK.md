@@ -126,16 +126,16 @@ Compute → Create cluster:
 
 Attach this cluster when running each notebook below.
 
-### 2.3 Edit Postgres placeholders (only if you'll push to Postgres)
+### 2.3 Edit Azure SQL placeholders (only if you'll push to Azure SQL)
 
 Edit `notebooks/config/pipeline_config.py` (bottom block) and replace
-`PG_HOST`, `PG_USER`, `PG_PASSWORD` — OR preferred — create a secret
-scope and the push notebook picks them up automatically:
+`AZSQL_HOST`, `AZSQL_USER`, `AZSQL_PASSWORD` — OR preferred — create a
+secret scope and the push notebook picks them up automatically:
 
 ```bash
 databricks secrets create-scope oos
-databricks secrets put-secret oos pg_user
-databricks secrets put-secret oos pg_password
+databricks secrets put-secret oos azsql_user
+databricks secrets put-secret oos azsql_password
 ```
 
 Skip this if you're not running step 2.10 yet.
@@ -248,25 +248,29 @@ The notebook prints a headline summary table (n_products, n_oos, oos_rate,
 total_reorder_qty). Sanity values: ~3,941 products and `oos_rate` between
 0.20 and 0.30.
 
-### 2.10 (Optional) Push to PostgreSQL
+### 2.10 (Optional) Push to Azure SQL Database
 
-Prereq: an Azure PostgreSQL Flexible Server is provisioned, the
-`portfolio.oos_agent_kpi` table is created (DDL in `README.md` Day 5), and
-either the secret scope from step 2.3 exists OR the placeholders in
-`pipeline_config.py` have been edited.
+Prereq: an Azure SQL Database is provisioned, the
+`oos_portfolio.dbo.oos_agent_kpi` table is created (DDL in `README.md`
+Day 5), and either the secret scope from step 2.3 exists OR the
+placeholders in `pipeline_config.py` have been edited.
 
-Open `notebooks/gold/08_push_to_postgres.py` → **Run all**.
+The SQL Server JDBC driver is **bundled with Databricks Runtime** — no
+Maven library install needed.
 
-Expected exit: `push_postgres rows=~3941`.
+Open `notebooks/gold/08_push_to_azure_sql.py` → **Run all**.
 
-Verify from any Postgres client (psql, DBeaver, pgAdmin):
+Expected exit: `push_azure_sql rows=~3941`.
+
+Verify from any SQL Server client (Azure Data Studio, SSMS, DBeaver,
+`sqlcmd`):
 ```sql
-SELECT COUNT(*), MAX(observation_date) FROM portfolio.oos_agent_kpi;
+SELECT COUNT(*), MAX(observation_date) FROM oos_portfolio.dbo.oos_agent_kpi;
 ```
 
 ### 2.11 Export sample CSV for the local Streamlit demo (optional)
 
-If you want to run the dashboard locally without Postgres, export the
+If you want to run the dashboard locally without Azure SQL, export the
 gold table to a CSV from a Databricks notebook cell:
 
 ```python
@@ -358,5 +362,6 @@ dbutils.notebook.run(
 | Tier distribution looks like 90/10/0 or 0/0/100 | Threshold mismatch with currency/granularity | Re-check `TIER_T*_MIN_DAILY` in `pipeline_config.py` |
 | `trend_factor` is exactly 1.0 for everyone | Trend filter too aggressive (or 0-day window) | Inspect `sdf_trend` after the `.filter(isNotNull)` |
 | `oos_rate` is 0% or 100% | `BALANCE_SIM_MULT_LOW/HIGH` mis-tuned | Tweak in `pipeline_config.py` |
-| `08_push_to_postgres` hangs | PG firewall blocks Databricks IPs | Add Databricks workspace outbound IPs to PG firewall rules |
-| Streamlit shows "Failed to load data" | Wrong env var or no CSV at path | Confirm `PG_HOST`/`OOS_CSV_PATH` |
+| `08_push_to_azure_sql` hangs | Azure SQL firewall blocks Databricks IPs | Portal → SQL server → Networking → check "Allow Azure services and resources to access this server" |
+| `08_push_to_azure_sql` fails with `Login failed for user` | Password wrong, or you used `<user>@<server>` (legacy syntax) | Use just `<user>` for SQL authentication |
+| Streamlit shows "Failed to load data" | Wrong env var or no CSV at path | Confirm `AZSQL_HOST`/`OOS_CSV_PATH` |

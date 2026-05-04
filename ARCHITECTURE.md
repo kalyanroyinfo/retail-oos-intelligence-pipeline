@@ -23,8 +23,8 @@ Unity Catalog — catalog: oos_portfolio
   └── gold.oos_agent_kpi
         │
         ▼  (Spark JDBC)
-Azure PostgreSQL Flexible Server
-  └── portfolio.oos_agent_kpi
+Azure SQL Database
+  └── oos_portfolio.dbo.oos_agent_kpi
         │
         ▼
 Power BI dashboard (or Streamlit alternative)
@@ -62,7 +62,7 @@ notebooks/
 ├── silver/05_compute_backtest.py
 ├── silver/06_compute_balance_snapshot.py
 ├── gold/07_compute_kpis.py
-├── gold/08_push_to_postgres.py
+├── gold/08_push_to_azure_sql.py
 └── analysis/Results_and_Analysis.ipynb
 ```
 
@@ -85,7 +85,7 @@ notebooks/
 07_compute_kpis
         │
         ▼
-08_push_to_postgres
+08_push_to_azure_sql
 ```
 
 ## Diagram

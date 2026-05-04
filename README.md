@@ -42,7 +42,7 @@ UCI Online Retail CSV (split into daily files)
         ↓
    Unity Catalog: oos_portfolio.gold.oos_agent_kpi
         ↓
-   Azure PostgreSQL (serving layer)
+   Azure SQL Database (serving layer)
         ↓
    Power BI (dashboard)
 
@@ -121,7 +121,7 @@ notebooks/
 │   └── 06_compute_balance_snapshot.py
 ├── gold/
 │   ├── 07_compute_kpis.py
-│   └── 08_push_to_postgres.py
+│   └── 08_push_to_azure_sql.py
 └── analysis/
     └── Results_and_Analysis.ipynb      ← portfolio "proof of work" charts
 ```
@@ -155,7 +155,7 @@ Run in order; each requires the previous to succeed.
 | 05 | `silver/05_compute_backtest.py` | Silver | Walk-forward backtest, WAPE, bias correction | Day 4 |
 | 06 | `silver/06_compute_balance_snapshot.py` | Silver | Simulated current balance per product | Day 4 |
 | 07 | `gold/07_compute_kpis.py` | Gold | Final OOS KPIs with corrected forecast | Day 5 |
-| 08 | `gold/08_push_to_postgres.py` | Gold | JDBC write to Azure PostgreSQL | Day 5 |
+| 08 | `gold/08_push_to_azure_sql.py` | Gold | JDBC write to Azure SQL Database | Day 5 |
 | 00 | `00_run_full_pipeline.py` | Master | Orchestrates all 8 ETL notebooks in dependency order | Day 6 |
 
 #### C. Shared config + analysis
@@ -328,8 +328,8 @@ with ThreadPoolExecutor(max_workers=2) as ex:
 # ── STEP 5: Gold KPIs (depends on all silver tables) ─────────────
 run_step("gold_kpis", "./gold/07_compute_kpis")
 
-# ── STEP 6: Push to PostgreSQL (final serving layer) ─────────────
-run_step("push_postgres", "./gold/08_push_to_postgres")
+# ── STEP 6: Push to Azure SQL Database (final serving layer) ─────
+run_step("push_azure_sql", "./gold/08_push_to_azure_sql")
 
 # ── Pipeline summary ─────────────────────────────────────────────
 dbutils.notebook.exit(f"SUCCESS run_date={run_date} env={env}")
@@ -353,7 +353,7 @@ dbutils.notebook.exit(f"SUCCESS run_date={run_date} env={env}")
                    07_compute_kpis
                          │
                          ▼
-                   08_push_to_postgres
+                   08_push_to_azure_sql
 ```
 
 ### Two orchestration options (pick one for Day 6)
@@ -908,7 +908,7 @@ populated with ~300 days of historical data.
 
 ---
 
-# DAY 5 — Gold Layer + Azure PostgreSQL
+# DAY 5 — Gold Layer + Azure SQL Database
 
 **Time: 7–8 hrs**
 
@@ -930,40 +930,60 @@ populated with ~300 days of historical data.
   - Write to `oos_portfolio.gold.oos_agent_kpi` Delta
 - [ ] Verify: OOS rate (~20–30%), tier breakdown, threshold distribution sensible
 
-## Afternoon (4 hrs) — PostgreSQL + Push
+## Afternoon (4 hrs) — Azure SQL Database + Push
 
-- [ ] Create **Azure Database for PostgreSQL** Flexible Server (B1ms — cheapest tier)
-- [ ] Configure firewall: allow Databricks workspace IPs + your local IP
-- [ ] Create schema and table:
-  ```sql
-  CREATE SCHEMA portfolio;
-  CREATE TABLE portfolio.oos_agent_kpi (
-      stock_code VARCHAR(20),
-      country VARCHAR(50),
-      tier VARCHAR(15),
-      current_balance DECIMAL(12,2),
-      corrected_forecast DECIMAL(12,2),
-      oos_threshold DECIMAL(12,2),
-      is_oos BOOLEAN,
-      reorder_qty DECIMAL(12,2),
-      balance_color VARCHAR(10),
-      wape DECIMAL(5,2),
-      observation_date DATE,
-      PRIMARY KEY (stock_code, observation_date)
-  );
-  CREATE INDEX idx_oos_country ON portfolio.oos_agent_kpi(country);
-  CREATE INDEX idx_oos_tier ON portfolio.oos_agent_kpi(tier);
+- [ ] Create **Azure SQL Database** (Basic tier — ~$5/month, cheapest):
+  ```bash
+  az sql server create \
+    --resource-group rg-oos-portfolio \
+    --name oos-sql-server \
+    --location eastus \
+    --admin-user oosadmin \
+    --admin-password '<strong-password>'
+
+  az sql db create \
+    --resource-group rg-oos-portfolio \
+    --server oos-sql-server \
+    --name oos_portfolio \
+    --service-objective Basic
   ```
-- [ ] Write `etl/gold/push_to_postgres.py` using Spark JDBC:
+- [ ] Configure firewall — Portal → SQL server → Networking:
+  - ✅ **"Allow Azure services and resources to access this server"** (lets Databricks reach it)
+  - **+ Add current client IP** for local connections
+- [ ] Create the table (T-SQL — note `BIT` instead of `BOOLEAN`):
+  ```sql
+  USE oos_portfolio;
+
+  CREATE TABLE dbo.oos_agent_kpi (
+      stock_code         VARCHAR(20)  NOT NULL,
+      country            VARCHAR(50),
+      tier               VARCHAR(15),
+      current_balance    DECIMAL(12,2),
+      corrected_forecast DECIMAL(12,2),
+      oos_threshold      DECIMAL(12,2),
+      is_oos             BIT,
+      reorder_qty        DECIMAL(12,2),
+      balance_color      VARCHAR(10),
+      wape               DECIMAL(5,2),
+      observation_date   DATE         NOT NULL,
+      CONSTRAINT pk_oos_agent_kpi PRIMARY KEY (stock_code, observation_date)
+  );
+  CREATE INDEX idx_oos_country ON dbo.oos_agent_kpi(country);
+  CREATE INDEX idx_oos_tier    ON dbo.oos_agent_kpi(tier);
+  ```
+- [ ] **JDBC driver** is already bundled with Databricks Runtime — no Maven library install needed.
+- [ ] Write `notebooks/gold/08_push_to_azure_sql.py` using Spark JDBC:
   ```python
-  df.write.format("jdbc").option("url", jdbc_url) \
-      .option("dbtable", "portfolio.oos_agent_kpi") \
+  df.write.format("jdbc") \
+      .option("url", "jdbc:sqlserver://<host>:1433;database=oos_portfolio;encrypt=true;trustServerCertificate=false") \
+      .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver") \
+      .option("dbtable", "dbo.oos_agent_kpi") \
       .option("user", user).option("password", pwd) \
       .mode("overwrite").save()
   ```
-- [ ] Verify data in pgAdmin or DBeaver
+- [ ] Verify data in Azure Data Studio, SSMS, DBeaver, or `sqlcmd`
 
-**End of Day 5 deliverable:** Gold KPIs in PostgreSQL, queryable.
+**End of Day 5 deliverable:** Gold KPIs in Azure SQL Database, queryable.
 
 ---
 
@@ -974,7 +994,7 @@ populated with ~300 days of historical data.
 ## Morning (3–4 hrs) — Azure Data Factory Pipeline
 
 - [ ] Create ADF instance in same resource group
-- [ ] Create linked services: ADLS Gen2, Databricks, Azure PostgreSQL
+- [ ] Create linked services: ADLS Gen2, Databricks, Azure SQL Database
 - [ ] Build pipeline with **Databricks Notebook activities** chained:
   ```
   bronze_autoloader (Auto Loader, trigger=availableNow)
@@ -987,7 +1007,7 @@ populated with ~300 days of historical data.
       ↓
   gold_kpis
       ↓
-  push_postgres
+  push_azure_sql
   ```
 - [ ] Configure daily trigger at 06:00 UTC
 - [ ] Trigger a manual test run end-to-end
@@ -998,7 +1018,7 @@ populated with ~300 days of historical data.
 ## Afternoon (3–4 hrs) — Power BI Dashboard
 
 - [ ] Install Power BI Desktop (Windows only — if Mac, use Power BI Service web editor or **Streamlit** as substitute)
-- [ ] Connect to Azure PostgreSQL
+- [ ] Connect to Azure SQL Database
 - [ ] Build **2 pages** (compressed scope):
 
   **Page 1: OOS Overview**
@@ -1027,13 +1047,13 @@ populated with ~300 days of historical data.
 ## Morning (3 hrs) — Documentation
 
 - [ ] Create architecture diagram in [Excalidraw](https://excalidraw.com) (fastest):
-  - UCI CSV → ADLS Bronze → Databricks (Bronze→Silver→Gold) → PostgreSQL → Power BI
+  - UCI CSV → ADLS Bronze → Databricks (Bronze→Silver→Gold) → Azure SQL → Power BI
   - Show ADF orchestration layer
 - [ ] Write `ARCHITECTURE.md` with the diagram embedded
 - [ ] Update `README.md` with:
   - **Problem statement** (3–4 sentences — why OOS detection matters in retail)
   - **Architecture diagram** (embedded image)
-  - **Tech stack badges**: Azure, Databricks, Delta Lake, Python 3.10, Power BI, PostgreSQL
+  - **Tech stack badges**: Azure, Databricks, Delta Lake, Python 3.10, Power BI, Azure SQL
   - **Results section**:
     - Median WAPE: e.g., 32%
     - OOS detection rate: e.g., 78%
@@ -1068,7 +1088,7 @@ populated with ~300 days of historical data.
   - Test DOW median calculation with known input
 - [ ] Final commit + push to main
 - [ ] Add project to CV under "Projects":
-  > **Azure Retail OOS Detection Pipeline** — End-to-end medallion-architecture data pipeline (Bronze/Silver/Gold) using Azure Data Factory, Databricks (PySpark), Delta Lake, ADLS Gen2, and PostgreSQL; forecast model with walk-forward backtesting (WAPE) and self-updating bias correction; KPIs served to Power BI dashboard.
+  > **Azure Retail OOS Detection Pipeline** — End-to-end medallion-architecture data pipeline (Bronze/Silver/Gold) using Azure Data Factory, Databricks (PySpark), Delta Lake, ADLS Gen2, and Azure SQL Database; forecast model with walk-forward backtesting (WAPE) and self-updating bias correction; KPIs served to Power BI dashboard.
 - [ ] *(Optional, do tomorrow — not Day 7)* Draft LinkedIn post
 
 **End of Day 7 deliverable:** Public GitHub repo + live dashboard + CV entry. ✅
@@ -1157,13 +1177,13 @@ FROM oos_portfolio.gold.oos_agent_kpi;
 Expect: `oos_rate` ~0.20–0.30 (driven by `BALANCE_SIM_MULT_LOW/HIGH = 0.3 / 1.5`).
 If it's near 0 or near 1, the simulation multiplier is mis-tuned.
 
-**Postgres — push (`08_push_to_postgres`)**
+**Azure SQL — push (`08_push_to_azure_sql`)**
 ```sql
-SELECT COUNT(*), MAX(observation_date) FROM portfolio.oos_agent_kpi;
-SELECT * FROM portfolio.oos_agent_kpi WHERE is_oos LIMIT 10;
+SELECT COUNT(*), MAX(observation_date) FROM oos_portfolio.dbo.oos_agent_kpi;
+SELECT TOP 10 * FROM oos_portfolio.dbo.oos_agent_kpi WHERE is_oos = 1;
 ```
 Row count must equal the gold table; if it's smaller, JDBC silently dropped
-rows (usually an SSL/firewall hiccup).
+rows (usually a firewall hiccup — re-check "Allow Azure services" is on).
 
 ### 3. End-to-end smoke test
 
@@ -1203,7 +1223,7 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 | 2 | UC catalog/schema/volume + Auto Loader Bronze | **7–8** | Storage credential / external location config |
 | 3 | Incremental run #2 + Silver: history + tier + forecast | **7–8** | Heaviest day — start early |
 | 4 | Incremental run #3 + Backtest + balance simulation | 6–7 | — |
-| 5 | Gold KPIs + PostgreSQL | 7–8 | PostgreSQL firewall config |
+| 5 | Gold KPIs + Azure SQL | 7–8 | Azure SQL firewall config |
 | 6 | ADF orchestration + Power BI | 7–8 | ADF first-time learning curve |
 | 7 | Docs + publish | 6–7 | Buffer for spillover |
 
@@ -1219,7 +1239,7 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 | Community Edition lacks UC + Auto Loader | Use **Databricks Free Trial on Azure** (14 days, full features) |
 | Storage credential test fails | Confirm RBAC role propagated (~5 min); use Access Connector managed identity, not SP keys |
 | Auto Loader checkpoint corruption on re-runs | Never delete `_checkpoints` folder mid-test — clears file-tracking state |
-| PostgreSQL JDBC driver issues | Pre-download driver JAR; attach to cluster init script |
+| SQL Server JDBC issues | The driver is bundled with DBR 13.x+ — no install needed; if you hit class-not-found, you're on an unsupported runtime |
 | ADF learning curve | If stuck >2 hrs, use **Databricks Workflows** instead |
 | Power BI on Mac | Use Power BI Service web editor, or **Streamlit** as substitute |
 | Forecast WAPE looks bad | UCI dataset is volatile; document honestly + show bias correction improvement |
@@ -1241,7 +1261,7 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 
 ## Resume Bullet (after completion)
 
-> Architected an **end-to-end Azure data pipeline** (ADF, Databricks PySpark, **Unity Catalog**, **Auto Loader**, Delta Lake, ADLS Gen2, PostgreSQL) implementing **medallion architecture** (Bronze→Silver→Gold) for retail stock-out detection across 4,000+ products; ingested incremental daily files via `cloudFiles` with checkpoint-based file tracking; engineered a **DOW + trend + monthly-lift forecast model** with **walk-forward backtesting** (WAPE) and **self-updating bias correction**, served KPIs to a **Power BI dashboard** via daily-orchestrated pipelines.
+> Architected an **end-to-end Azure data pipeline** (ADF, Databricks PySpark, **Unity Catalog**, **Auto Loader**, Delta Lake, ADLS Gen2, Azure SQL) implementing **medallion architecture** (Bronze→Silver→Gold) for retail stock-out detection across 4,000+ products; ingested incremental daily files via `cloudFiles` with checkpoint-based file tracking; engineered a **DOW + trend + monthly-lift forecast model** with **walk-forward backtesting** (WAPE) and **self-updating bias correction**, served KPIs to a **Power BI dashboard** via daily-orchestrated pipelines.
 
 ---
 
@@ -1251,6 +1271,6 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 - [ ] **Day 2** — UC catalog/schema/volume + Auto Loader Bronze (run #1)
 - [ ] **Day 3** — Incremental run #2 + Silver: history + tiers + forecast
 - [ ] **Day 4** — Incremental run #3 + Backtest (WAPE) + simulated balance
-- [ ] **Day 5** — Gold KPIs + PostgreSQL serving
+- [ ] **Day 5** — Gold KPIs + Azure SQL serving
 - [ ] **Day 6** — ADF pipeline + Power BI dashboard
 - [ ] **Day 7** — Docs + public repo + CV updated

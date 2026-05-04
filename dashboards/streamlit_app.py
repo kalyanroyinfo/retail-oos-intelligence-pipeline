@@ -1,15 +1,15 @@
 """Retail OOS dashboard — 2-page Streamlit app.
 
-Reads from Postgres (`portfolio.oos_agent_kpi`) when available, or from a
-local CSV exported from `oos_portfolio.gold.oos_agent_kpi` when Postgres
-isn't reachable yet (demo mode).
+Reads from Azure SQL Database (`oos_portfolio.dbo.oos_agent_kpi`) when
+available, or from a local CSV exported from `oos_portfolio.gold.oos_agent_kpi`
+when Azure SQL isn't reachable yet (demo mode).
 
 Run locally:
     pip install -r dashboards/requirements.txt
-    export PG_HOST=...; export PG_USER=...; export PG_PASSWORD=...
+    export AZSQL_HOST=...; export AZSQL_USER=...; export AZSQL_PASSWORD=...
     streamlit run dashboards/streamlit_app.py
 
-Demo mode (no Postgres):
+Demo mode (no Azure SQL):
     export OOS_DATA_SOURCE=csv
     export OOS_CSV_PATH=dashboards/sample_kpi.csv
     streamlit run dashboards/streamlit_app.py
@@ -25,13 +25,13 @@ import streamlit as st
 
 st.set_page_config(page_title="Retail OOS Dashboard", layout="wide")
 
-PG_HOST     = os.getenv("PG_HOST",     "")
-PG_DB       = os.getenv("PG_DB",       "postgres")
-PG_USER     = os.getenv("PG_USER",     "")
-PG_PASSWORD = os.getenv("PG_PASSWORD", "")
-PG_TABLE    = os.getenv("PG_TABLE",    "portfolio.oos_agent_kpi")
+AZSQL_HOST     = os.getenv("AZSQL_HOST",     "")
+AZSQL_DB       = os.getenv("AZSQL_DB",       "oos_portfolio")
+AZSQL_USER     = os.getenv("AZSQL_USER",     "")
+AZSQL_PASSWORD = os.getenv("AZSQL_PASSWORD", "")
+AZSQL_TABLE    = os.getenv("AZSQL_TABLE",    "dbo.oos_agent_kpi")
 
-DATA_SOURCE = os.getenv("OOS_DATA_SOURCE", "postgres").lower()  # postgres | csv
+DATA_SOURCE = os.getenv("OOS_DATA_SOURCE", "azsql").lower()  # azsql | csv
 CSV_PATH    = os.getenv("OOS_CSV_PATH",    "dashboards/sample_kpi.csv")
 
 
@@ -42,17 +42,18 @@ def load_kpi() -> pd.DataFrame:
         return pd.read_csv(CSV_PATH)
 
     from sqlalchemy import create_engine
+    # mssql+pymssql:// uses the pymssql driver (FreeTDS-based, pure-Python
+    # binding in requirements.txt).  Azure SQL negotiates TLS automatically.
     url = (
-        f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:5432/{PG_DB}"
-        f"?sslmode=require"
+        f"mssql+pymssql://{AZSQL_USER}:{AZSQL_PASSWORD}@{AZSQL_HOST}:1433/{AZSQL_DB}"
     )
-    return pd.read_sql(f"SELECT * FROM {PG_TABLE}", create_engine(url))
+    return pd.read_sql(f"SELECT * FROM {AZSQL_TABLE}", create_engine(url))
 
 
 # ── Sidebar: source banner + filters ─────────────────────────────
 st.sidebar.markdown(f"**Source:** `{DATA_SOURCE}`")
-if DATA_SOURCE == "postgres" and not PG_HOST:
-    st.sidebar.error("PG_HOST not set. Export it or switch to CSV mode.")
+if DATA_SOURCE == "azsql" and not AZSQL_HOST:
+    st.sidebar.error("AZSQL_HOST not set. Export it or switch to CSV mode.")
     st.stop()
 
 try:
