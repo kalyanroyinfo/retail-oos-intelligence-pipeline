@@ -316,6 +316,38 @@ was deleted between runs — restore it or run again to rebuild.
 
 ---
 
+## Part 3 — Resets / clean slate
+
+When something goes sideways or you want to redo a step from scratch,
+use the reset notebooks under `notebooks/maintenance/`. Each defaults
+to DRY-RUN — set the `confirm` widget to `YES` to actually wipe.
+
+| Notebook | Wipes | Keeps |
+|---|---|---|
+| `maintenance/reset_bronze.py` | Landing volume contents (CSVs + `_checkpoints/` + `_schemas/`) and the Bronze Delta table | Silver + Gold tables |
+| `maintenance/reset_silver_gold.py` | All Silver tables and the Gold KPI table | Bronze, landing volume |
+| `maintenance/reset_all.py` | Everything the above two wipe, in order | Catalog, schemas, volume object, storage credential, external location |
+
+**Setup objects (catalog, schemas, volume, credential, external location) are intentionally never touched** by these — those are provisioned once via `notebooks/setup/` and rarely need redoing.
+
+### Typical use cases
+
+- **Restart the bucket A/B/C ingestion demo** → `reset_bronze` (then re-upload via azcopy + run Bronze)
+- **Iterate on forecast / KPI logic without re-ingesting** → `reset_silver_gold` (then re-run Silver + Gold notebooks against the existing Bronze table)
+- **Full pipeline replay** → `reset_all`, then re-upload CSVs and run the master orchestrator
+
+### Run programmatically
+
+```python
+dbutils.notebook.run(
+    "./notebooks/maintenance/reset_bronze",
+    600,
+    {"confirm": "YES"},
+)
+```
+
+---
+
 ## Quick "is it working?" cheat sheet
 
 | Symptom | Most likely cause | Fix |
