@@ -37,6 +37,11 @@ SCHEMA_LOC = f"{LANDING_VOLUME}/_schemas/bronze_sales"
 
 # COMMAND ----------
 
+print("CHECKPOINT LOCATION: "+CHECKPOINT)
+print("SCHEMA_LOC LOCATION: "+SCHEMA_LOC)
+
+# COMMAND ----------
+
 bronze_stream = (
     spark.readStream
         .format("cloudFiles")
