@@ -1,6 +1,6 @@
 # Azure OOS Pipeline Portfolio — 7-Day Plan
 
-**Goal:** Build a portfolio-ready Azure data engineering + ML pipeline (Bronze → Silver → Gold → Dashboard) using a public retail dataset, modeled on a real OOS detection use case.
+**Goal:** Build a portfolio-ready Azure data engineering pipeline (Bronze → Silver → Gold → Serving) using a public retail dataset, modeled on a real OOS detection use case. Aligned with the **DP-203 Azure Data Engineer Associate** scope (no BI / Power BI).
 
 **Total time:** ~45–55 hrs over 7 days (~6–8 hrs/day)
 **Budget:** ~$5–10 in Azure costs (uses free credits)
@@ -42,9 +42,7 @@ UCI Online Retail CSV (split into daily files)
         ↓
    Unity Catalog: oos_portfolio.gold.oos_agent_kpi
         ↓
-   Azure SQL Database (serving layer)
-        ↓
-   Power BI (dashboard)
+   Azure SQL Database (serving layer — read by any downstream BI/app)
 
 Orchestration: Azure Data Factory — daily trigger 06:00 UTC
 ```
@@ -439,7 +437,6 @@ This template — widgets → read → transform → write → exit — keeps ev
   │   ├── silver/
   │   └── gold/
   ├── notebooks/
-  ├── dashboards/
   ├── docs/
   └── tests/
   ```
@@ -900,7 +897,7 @@ populated with ~300 days of historical data.
   - UCI dataset has no real-time inventory balance — simulate it
   - For each product:
     - `current_balance = (sum of last 3 days sales) × random_uniform(0.3, 1.5)`
-  - This deliberately creates ~20–30% OOS rate so the dashboard has interesting data
+  - This deliberately creates ~20–30% OOS rate so the gold KPIs have meaningful variation
   - Set seed for reproducibility
   - Write to `oos_portfolio.silver.oos_balance_snapshot` Delta
 
@@ -987,7 +984,7 @@ populated with ~300 days of historical data.
 
 ---
 
-# DAY 6 — Orchestration + Dashboard
+# DAY 6 — Orchestration + Monitoring
 
 **Time: 7–8 hrs**
 
@@ -1015,28 +1012,24 @@ populated with ~300 days of historical data.
 
 > 💡 **If ADF blocks you for >2 hrs:** Fall back to **Databricks Workflows** — native, simpler, same result on resume.
 
-## Afternoon (3–4 hrs) — Power BI Dashboard
+## Afternoon (3–4 hrs) — Monitoring & validation queries
 
-- [ ] Install Power BI Desktop (Windows only — if Mac, use Power BI Service web editor or **Streamlit** as substitute)
-- [ ] Connect to Azure SQL Database
-- [ ] Build **2 pages** (compressed scope):
+These are the data-engineering-side observability tasks — equivalent of "did
+last night's job land what we expected?" SQL playbooks.
 
-  **Page 1: OOS Overview**
-  - KPI cards: total products, OOS count, OOS %, total reorder qty
-  - Bar chart: OOS count by tier (T1/T2/T3)
-  - Map: OOS rate by Country
-  - Table: top-20 products by `reorder_qty`
+- [ ] Create an **Azure Monitor Log Analytics workspace** in the same resource group
+- [ ] Wire ADF to send pipeline-run logs to Log Analytics (ADF → Diagnostic settings → "Send to Log Analytics workspace")
+- [ ] Wire Databricks workspace diagnostic logs (Databricks → Diagnostic settings → "Send to Log Analytics")
+- [ ] Save 3 KQL queries in the Log Analytics workspace:
+  - last 24 h pipeline runs by status
+  - average notebook runtime per step
+  - failure stack-trace excerpts for the last failed run
+- [ ] Save the SQL validation queries from `RUNBOOK.md → Testing` into the Azure SQL **Query Store** (or just commit them under `docs/sql_checks/`):
+  - row-count delta vs gold table
+  - duplicate-PK detector
+  - null/threshold sanity checks
 
-  **Page 2: Forecast Accuracy**
-  - WAPE histogram
-  - Bias-correction distribution (before/after bar chart)
-  - Top-10 worst-forecast products table
-  - Forecast vs actual line chart for 3 sample products
-
-- [ ] Publish to Power BI Service free workspace
-- [ ] Take screenshots for README
-
-**End of Day 6 deliverable:** Automated daily pipeline + live dashboard.
+**End of Day 6 deliverable:** Automated daily pipeline + observability + post-run validation queries committed.
 
 ---
 
@@ -1047,19 +1040,19 @@ populated with ~300 days of historical data.
 ## Morning (3 hrs) — Documentation
 
 - [ ] Create architecture diagram in [Excalidraw](https://excalidraw.com) (fastest):
-  - UCI CSV → ADLS Bronze → Databricks (Bronze→Silver→Gold) → Azure SQL → Power BI
-  - Show ADF orchestration layer
+  - UCI CSV → ADLS Bronze → Databricks (Bronze→Silver→Gold) → Azure SQL
+  - Show ADF orchestration layer + Log Analytics
 - [ ] Write `ARCHITECTURE.md` with the diagram embedded
 - [ ] Update `README.md` with:
   - **Problem statement** (3–4 sentences — why OOS detection matters in retail)
   - **Architecture diagram** (embedded image)
-  - **Tech stack badges**: Azure, Databricks, Delta Lake, Python 3.10, Power BI, Azure SQL
+  - **Tech stack badges**: Azure, Databricks, Delta Lake, Python 3.10, Azure SQL, Azure Data Factory, Log Analytics
   - **Results section**:
     - Median WAPE: e.g., 32%
     - OOS detection rate: e.g., 78%
     - Tier distribution: T1 18% / T2 31% / T3 51%
     - Bias-correction impact: e.g., reduced systematic under-forecast by 28%
-  - **Dashboard screenshots** (2–3 images)
+    - Auto Loader incremental-ingestion proof (3 screenshots)
   - **How to run** (5-step quickstart)
   - **Cost breakdown**: ~$5–10 total
 
@@ -1088,10 +1081,10 @@ populated with ~300 days of historical data.
   - Test DOW median calculation with known input
 - [ ] Final commit + push to main
 - [ ] Add project to CV under "Projects":
-  > **Azure Retail OOS Detection Pipeline** — End-to-end medallion-architecture data pipeline (Bronze/Silver/Gold) using Azure Data Factory, Databricks (PySpark), Delta Lake, ADLS Gen2, and Azure SQL Database; forecast model with walk-forward backtesting (WAPE) and self-updating bias correction; KPIs served to Power BI dashboard.
+  > **Azure Retail OOS Detection Pipeline** — End-to-end medallion-architecture data pipeline (Bronze/Silver/Gold) using Azure Data Factory, Databricks (PySpark), Delta Lake, Unity Catalog, Auto Loader, ADLS Gen2, and Azure SQL Database; forecast model with walk-forward backtesting (WAPE) and self-updating bias correction; serving-layer KPIs queryable via standard SQL.
 - [ ] *(Optional, do tomorrow — not Day 7)* Draft LinkedIn post
 
-**End of Day 7 deliverable:** Public GitHub repo + live dashboard + CV entry. ✅
+**End of Day 7 deliverable:** Public GitHub repo + live ETL pipeline + CV entry. ✅
 
 ---
 
@@ -1224,7 +1217,7 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 | 3 | Incremental run #2 + Silver: history + tier + forecast | **7–8** | Heaviest day — start early |
 | 4 | Incremental run #3 + Backtest + balance simulation | 6–7 | — |
 | 5 | Gold KPIs + Azure SQL | 7–8 | Azure SQL firewall config |
-| 6 | ADF orchestration + Power BI | 7–8 | ADF first-time learning curve |
+| 6 | ADF orchestration + Log Analytics | 7–8 | ADF first-time learning curve |
 | 7 | Docs + publish | 6–7 | Buffer for spillover |
 
 **Total: ~48–54 hours**
@@ -1241,7 +1234,6 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 | Auto Loader checkpoint corruption on re-runs | Never delete `_checkpoints` folder mid-test — clears file-tracking state |
 | SQL Server JDBC issues | The driver is bundled with DBR 13.x+ — no install needed; if you hit class-not-found, you're on an unsupported runtime |
 | ADF learning curve | If stuck >2 hrs, use **Databricks Workflows** instead |
-| Power BI on Mac | Use Power BI Service web editor, or **Streamlit** as substitute |
 | Forecast WAPE looks bad | UCI dataset is volatile; document honestly + show bias correction improvement |
 
 ---
@@ -1253,7 +1245,7 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 | Bicep/Terraform IaC | Nice-to-have, not critical for resume credibility |
 | GitHub Actions CI | Adds polish but doesn't change the project's substance |
 | LinkedIn article on Day 18 | Better written *after* a week of using the project |
-| 4-page Power BI dashboard | 2 pages tell the same story — diminishing returns |
+| Power BI / dashboards layer | Out of scope for DP-203 (data engineer cert). Dashboards = PL-300 territory. |
 | Cost optimization deep-dive | Mention briefly in README; not a Day's worth of work |
 | Multiple unit tests | One representative test is enough for portfolio context |
 
@@ -1261,7 +1253,7 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 
 ## Resume Bullet (after completion)
 
-> Architected an **end-to-end Azure data pipeline** (ADF, Databricks PySpark, **Unity Catalog**, **Auto Loader**, Delta Lake, ADLS Gen2, Azure SQL) implementing **medallion architecture** (Bronze→Silver→Gold) for retail stock-out detection across 4,000+ products; ingested incremental daily files via `cloudFiles` with checkpoint-based file tracking; engineered a **DOW + trend + monthly-lift forecast model** with **walk-forward backtesting** (WAPE) and **self-updating bias correction**, served KPIs to a **Power BI dashboard** via daily-orchestrated pipelines.
+> Architected an **end-to-end Azure data pipeline** (ADF, Databricks PySpark, **Unity Catalog**, **Auto Loader**, Delta Lake, ADLS Gen2, Azure SQL) implementing **medallion architecture** (Bronze→Silver→Gold) for retail stock-out detection across 4,000+ products; ingested incremental daily files via `cloudFiles` with checkpoint-based file tracking; engineered a **DOW + trend + monthly-lift forecast model** with **walk-forward backtesting** (WAPE) and **self-updating bias correction**; serving-layer KPIs surfaced via JDBC to Azure SQL Database, with Log Analytics observability and ADF daily orchestration.
 
 ---
 
@@ -1272,5 +1264,5 @@ partitions also re-ingest, the checkpoint is mis-configured (most often the
 - [ ] **Day 3** — Incremental run #2 + Silver: history + tiers + forecast
 - [ ] **Day 4** — Incremental run #3 + Backtest (WAPE) + simulated balance
 - [ ] **Day 5** — Gold KPIs + Azure SQL serving
-- [ ] **Day 6** — ADF pipeline + Power BI dashboard
+- [ ] **Day 6** — ADF pipeline + Log Analytics monitoring
 - [ ] **Day 7** — Docs + public repo + CV updated

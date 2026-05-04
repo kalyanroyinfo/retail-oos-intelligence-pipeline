@@ -27,7 +27,7 @@ Azure SQL Database
   └── oos_portfolio.dbo.oos_agent_kpi
         │
         ▼
-Power BI dashboard (or Streamlit alternative)
+(Serving layer — read by any downstream consumer via standard SQL/JDBC)
 ```
 
 Orchestration: Azure Data Factory (or Databricks Workflows) calls

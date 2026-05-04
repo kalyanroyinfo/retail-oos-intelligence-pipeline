@@ -7,7 +7,7 @@ SQL queries) — the runbook tells you *how* to run, the README tells you
 
 There are two execution surfaces:
 
-- **Local** (your laptop) — unit tests, the CSV splitter, the Streamlit dashboard
+- **Local** (your laptop) — unit tests, the CSV splitter
 - **Databricks** (workspace) — every notebook under `notebooks/`
 
 ---
@@ -77,24 +77,6 @@ ls daily_files | sort | head -n -2 | xargs -I{} mv daily_files/{} daily_files_bu
 ls daily_files | sort | head -n 1   | xargs -I{} mv daily_files/{} daily_files_bucketB/
 mv daily_files/* daily_files_bucketC/   # whatever's left = last day
 ```
-
-### 1.4 Run the Streamlit dashboard (CSV demo mode)
-
-You need a `sample_kpi.csv` first — see Part 2 step 2.11 to export one
-from Databricks. Once you have it:
-
-```bash
-pip install -r dashboards/requirements.txt
-export OOS_DATA_SOURCE=csv
-export OOS_CSV_PATH=dashboards/sample_kpi.csv
-streamlit run dashboards/streamlit_app.py
-```
-
-Expected: a tab opens at <http://localhost:8501> showing the OOS Overview
-page. Sidebar shows `Source: csv`. Switch pages via the sidebar radio.
-
-If you see `Failed to load data: [Errno 2] No such file or directory`, the
-CSV path is wrong — fix `OOS_CSV_PATH`.
 
 ---
 
@@ -268,21 +250,7 @@ Verify from any SQL Server client (Azure Data Studio, SSMS, DBeaver,
 SELECT COUNT(*), MAX(observation_date) FROM oos_portfolio.dbo.oos_agent_kpi;
 ```
 
-### 2.11 Export sample CSV for the local Streamlit demo (optional)
-
-If you want to run the dashboard locally without Azure SQL, export the
-gold table to a CSV from a Databricks notebook cell:
-
-```python
-(spark.table("oos_portfolio.gold.oos_agent_kpi")
-      .toPandas()
-      .to_csv("/Workspace/Users/<your-email>/sample_kpi.csv", index=False))
-```
-
-Then download via the Workspace UI (right-click the file → Download) and
-drop it at `dashboards/sample_kpi.csv` locally. Now Part 1 step 1.4 works.
-
-### 2.12 End-to-end smoke test (master orchestrator)
+### 2.11 End-to-end smoke test (master orchestrator)
 
 After steps 2.4–2.5 (setup) succeeded once, you don't run setup again. From
 this point on, the entire daily pipeline is one notebook:
@@ -300,7 +268,7 @@ dbutils.notebook.run(
 Expected: 8 `START …` / `END …` log lines, finishing with
 `SUCCESS run_date=2026-05-03 env=dev`.
 
-### 2.13 Prove incremental ingestion (Auto Loader)
+### 2.12 Prove incremental ingestion (Auto Loader)
 
 This is the screenshot-worthy demo. After Bronze has run on Bucket A:
 
@@ -364,4 +332,3 @@ dbutils.notebook.run(
 | `oos_rate` is 0% or 100% | `BALANCE_SIM_MULT_LOW/HIGH` mis-tuned | Tweak in `pipeline_config.py` |
 | `08_push_to_azure_sql` hangs | Azure SQL firewall blocks Databricks IPs | Portal → SQL server → Networking → check "Allow Azure services and resources to access this server" |
 | `08_push_to_azure_sql` fails with `Login failed for user` | Password wrong, or you used `<user>@<server>` (legacy syntax) | Use just `<user>` for SQL authentication |
-| Streamlit shows "Failed to load data" | Wrong env var or no CSV at path | Confirm `AZSQL_HOST`/`OOS_CSV_PATH` |

@@ -1,5 +1,0 @@
-streamlit>=1.30
-pandas>=2.0
-plotly>=5.18
-sqlalchemy>=2.0
-pymssql>=2.2.11
