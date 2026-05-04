@@ -53,7 +53,18 @@ jdbc_url = (
 
 sdf_gold = spark.table(T_GOLD_KPI)
 
-(sdf_gold.write
+# Defensive dedupe on the PK to satisfy the destination's UNIQUE constraint.
+# If the gold table is clean this is a no-op; if upstream produced two rows
+# with the same (stock_code, observation_date) — usually from inconsistent
+# StockCode whitespace/case in bronze — keeping the first is fine for now.
+# Long-term fix: clean StockCode upstream in silver/02_compute_history.
+sdf_gold_dedup = sdf_gold.dropDuplicates(["stock_code", "observation_date"])
+
+dropped = sdf_gold.count() - sdf_gold_dedup.count()
+if dropped:
+    print(f"WARNING: dropped {dropped} duplicate (stock_code, observation_date) rows before push.")
+
+(sdf_gold_dedup.write
     .format("jdbc")
     .option("url", jdbc_url)
     .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
@@ -66,5 +77,5 @@ sdf_gold = spark.table(T_GOLD_KPI)
 
 # COMMAND ----------
 
-row_count = sdf_gold.count()
+row_count = sdf_gold_dedup.count()
 dbutils.notebook.exit(f"push_azure_sql rows={row_count} run_date={run_date}")

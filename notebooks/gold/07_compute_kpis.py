@@ -31,7 +31,12 @@ sdf_accuracy = spark.table(T_SILVER_ACCURACY).select("StockCode", "wape", "bias_
 sdf_stats    = spark.table(T_SILVER_AGENT_STATS).select("StockCode", "tier")
 
 # Country comes from the bronze table — pick the most-recent country per product.
+# Normalise StockCode the same way silver/02 does, otherwise bronze's raw
+# whitespace/case variants produce two country rows for what the silver
+# layer treats as one product, and the join below blows up by a factor.
 sdf_country = (spark.table(T_BRONZE_SALES)
+    .withColumn("StockCode", F.upper(F.trim(F.col("StockCode"))))
+    .filter(F.col("StockCode") != "")
     .groupBy("StockCode")
     .agg(F.last("Country", ignorenulls=True).alias("country"))
 )

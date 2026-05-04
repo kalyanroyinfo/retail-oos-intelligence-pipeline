@@ -24,6 +24,12 @@ sdf_history = (
     sdf_bronze
         .filter(F.col("Quantity") > 0)               # drop returns/cancellations
         .filter(F.col("UnitPrice") > 0)
+        # Normalise StockCode so trim/case differences in bronze
+        # ("84997c" vs "84997C" vs "84997c ") collapse to a single key.
+        # Without this, every downstream silver/gold table inherits
+        # the duplication and Azure SQL's PK rejects the push.
+        .withColumn("StockCode", F.upper(F.trim(F.col("StockCode"))))
+        .filter(F.col("StockCode") != "")             # drop empty codes
         .withColumn("line_revenue", F.col("Quantity") * F.col("UnitPrice"))
         .groupBy("StockCode", "tbl_dt")
         .agg(F.sum("line_revenue").alias("daily_sales"))
