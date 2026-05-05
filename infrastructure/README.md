@@ -20,7 +20,7 @@ pipeline depends on.  Run once per environment.
 | 7 | Storage Credential (UC) | `cred_oos_portfolio` | UC's pointer to the AC |
 | 8 | External Location (UC) | `ext_lakehouse` | UC's view of the container |
 | 9 | Catalog + schemas + volume | `oos_portfolio` etc. | Created via `notebooks/setup/` |
-| 10 | Azure SQL Database (serving) | `oos-sql-server` / `oos_portfolio` | Where gold KPIs land |
+| 10 | Azure SQL Database (serving) | `<your-sql-server>` / `oos_portfolio` | Where gold KPIs land |
 
 ---
 
@@ -275,9 +275,9 @@ Portal → top search → **"SQL databases"** → **+ Create**.
 |---|---|
 | Resource group | `rg-oos-portfolio` |
 | Database name | `oos_portfolio` |
-| Server | **Create new** → name `oos-sql-server` |
+| Server | **Create new** → name `<your-sql-server>` |
 | Server → Authentication | **Use SQL authentication** |
-| Server → Admin login | `oosadmin` |
+| Server → Admin login | `<your-admin-login>` |
 | Server → Password | strong (8–128 chars, ≥ 3 of: upper / lower / digit / symbol) |
 | Server → Region | same as RG |
 | Want to use SQL elastic pool | **No** |
@@ -299,7 +299,7 @@ Portal → top search → **"SQL databases"** → **+ Create**.
 
 ### Step 10a — Create the table
 
-After deployment → **Go to resource** (the database, not the server) → **Query editor (preview)** (left nav) → sign in with `oosadmin`.
+After deployment → **Go to resource** (the database, not the server) → **Query editor (preview)** (left nav) → sign in with `<your-admin-login>`.
 
 Run:
 
@@ -328,7 +328,7 @@ CREATE INDEX idx_oos_tier    ON dbo.oos_agent_kpi(tier);
 
 The server's **Overview** page shows:
 ```
-oos-sql-server.database.windows.net    ← AZSQL_HOST
+<your-sql-server>.database.windows.net    ← AZSQL_HOST
 ```
 
 Paste it into `notebooks/config/pipeline_config.py` (`AZSQL_HOST`), or store user/password in a Databricks secret scope (paste the same values via `databricks secrets put-secret oos azsql_user` / `azsql_password`).
@@ -495,8 +495,8 @@ Expected rows:
 - `oosstorage` (Microsoft.Storage/storageAccounts)
 - `ac-oos-portfolio` (Microsoft.Databricks/accessConnectors)
 - `dbw-oos-portfolio` (Microsoft.Databricks/workspaces)
-- `oos-sql-server` (Microsoft.Sql/servers)
-- `oos-sql-server/oos_portfolio` (Microsoft.Sql/servers/databases)
+- `<your-sql-server>` (Microsoft.Sql/servers)
+- `<your-sql-server>/oos_portfolio` (Microsoft.Sql/servers/databases)
 
 In Databricks SQL editor:
 ```sql
@@ -538,7 +538,7 @@ To minimise:
 | `Standard` workspace can't see UC settings | Wrong tier | Recreate workspace as **Premium**; standard tier doesn't support UC |
 | Container creation rejected — "name contains invalid character" | Underscore in container name | Use `oos-portfolio` (hyphen) — that's the Azure rule |
 | `CREATE CATALOG` fails with "Metastore storage root URL does not exist" | Newer Databricks account with no default storage root | Already handled in `notebooks/setup/03_catalog_schemas.sql` (catalog has explicit `MANAGED LOCATION`) — re-run setup |
-| Azure SQL push fails with `Login failed for user` | Wrong password, or used `oosadmin@server` (legacy syntax) | Just `oosadmin` — Flexible Server doesn't use the @suffix |
+| Azure SQL push fails with `Login failed for user` | Wrong password, or used `<your-admin-login>@server` (legacy syntax) | Just `<your-admin-login>` — Flexible Server doesn't use the @suffix |
 | Azure SQL push hangs | Firewall blocks Databricks | Portal → SQL server → Networking → tick "Allow Azure services and resources to access this server" |
 
 ---

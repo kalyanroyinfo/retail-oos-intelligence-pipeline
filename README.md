@@ -187,98 +187,34 @@ Follow `infrastructure/README.md` for the full Portal walkthrough — 11 steps:
 10. Azure SQL Database `oos_portfolio` + `dbo.oos_agent_kpi` table
 11. Upload historical CSVs via `azcopy` + SAS
 
-### Phase 3 — Run the pipeline
+### Phase 3 — Import the repo into Databricks
 
-**Master orchestrator (recommended):**
+1. Databricks left nav → **Workspace** → click your username folder → **+ Add** → **Git folder**
+2. Paste this repo's public HTTPS URL → Provider: **GitHub** → **Create**
 
-```python
-dbutils.notebook.run("./notebooks/00_run_full_pipeline", 1800)
-```
+The repo clones to `/Workspace/Users/<your-email>/retail-oos-intelligence-pipeline/`.
+Pull updates later via ⋮ → **Pull**.
 
-Bronze → Silver (with parallel branches) → Gold → Azure SQL push.
-Total runtime: ~5–8 min.
+### Phase 4 — Run
 
-**Or run notebooks individually:**
-
-| Order | Notebook | Approx. runtime |
+| # | Action | Where |
 |---|---|---|
-| 1 | `bronze/01_ingest_bronze_autoloader` | 30–90 s |
-| 2 | `silver/02_compute_history` | 30 s |
-| 3 | `silver/03_compute_agent_stats` | 20 s |
-| 4 | `silver/04_compute_forecast` | 60 s |
-| 5 | `silver/05_compute_backtest` | 60 s |
-| 6 | `silver/06_compute_balance_snapshot` | 20 s |
-| 7 | `gold/07_compute_kpis` | 30 s |
-| 8 | `gold/08_push_to_azure_sql` | 60–120 s |
+| 1 | Start your cluster | Compute → cluster → **Start** |
+| 2 | Edit Azure SQL credentials | `notebooks/config/pipeline_config.py` — replace `REPLACE_ME` for `AZSQL_HOST`, `AZSQL_USER`, `AZSQL_PASSWORD` with your real values |
+| 3 | One-time Unity Catalog setup | `notebooks/setup/00_run_all_setup.py` → **Run all** |
+| 4 | Full pipeline | `notebooks/00_run_full_pipeline.py` → **Run all** *(Bronze → Silver → Gold → Azure SQL, ~5–8 min)* |
+| 5 | (optional) Analysis charts | `notebooks/analysis/Results_and_Analysis.ipynb` → **Run all** |
 
-### Phase 4 — Verify
-
-Sanity SQL — paste into any Databricks SQL cell:
+**Verify** in any SQL cell:
 
 ```sql
--- Bronze: row counts + ingestion timestamps
-SELECT tbl_dt, COUNT(*) AS rows, MAX(ingested_at) AS latest_ingestion
-FROM oos_portfolio.bronze.sales
-GROUP BY tbl_dt ORDER BY tbl_dt DESC LIMIT 10;
-
--- Silver: tier distribution should be ~22 / 38 / 40
-SELECT tier, COUNT(*) AS n FROM oos_portfolio.silver.agent_stats GROUP BY tier ORDER BY tier;
-
--- Silver: forecast accuracy
-SELECT percentile_approx(wape, array(0.25, 0.5, 0.75)) AS quartiles,
-       AVG(CAST((wape < 0.5) AS INT))                  AS pct_under_50
-FROM oos_portfolio.silver.oos_forecast_accuracy;
-
--- Gold: headline KPIs
-SELECT COUNT(*)                                            AS n_products,
-       SUM(CASE WHEN is_oos THEN 1 ELSE 0 END)             AS n_oos,
-       ROUND(AVG(CASE WHEN is_oos THEN 1.0 ELSE 0.0 END), 3) AS oos_rate,
-       SUM(reorder_qty)                                    AS total_reorder_qty
+SELECT COUNT(*) AS n_products,
+       SUM(CASE WHEN is_oos THEN 1 ELSE 0 END) AS n_oos,
+       ROUND(AVG(CASE WHEN is_oos THEN 1.0 ELSE 0.0 END), 3) AS oos_rate
 FROM oos_portfolio.gold.oos_agent_kpi;
 ```
 
-Then in Azure SQL Query editor:
-
-```sql
-SELECT COUNT(*), MAX(observation_date) FROM oos_portfolio.dbo.oos_agent_kpi;
-```
-
-Row count should match `oos_portfolio.gold.oos_agent_kpi` on Databricks.
-
-Expected ranges (UCI dataset): ~3,941 products, OOS rate 0.20–0.30, median WAPE 0.30–0.60.
-
-### Phase 5 — Generate analysis charts
-
-The portfolio "proof of work" notebook lives at
-`notebooks/analysis/Results_and_Analysis.ipynb` — 11 charts / tables across
-5 sections (data overview, tier story, forecast methodology, forecast
-accuracy, OOS outcomes).
-
-To run:
-
-1. Open the notebook in Databricks
-2. Attach to your cluster
-3. **Run all**
-
-Sections produced:
-
-| Section | Output |
-|---|---|
-| **A.1** Data shape card | rows / products / date range / countries |
-| **A.2** Daily revenue over time | line chart |
-| **B.1** Tier composition + revenue Pareto | grouped bar (% products vs % revenue) |
-| **C.1** Day-of-week seasonality | bar chart per DOW |
-| **C.2** Trend factor distribution per tier | 3-pane histogram |
-| **D.1** WAPE histogram | overall accuracy distribution |
-| **D.2** WAPE summary metrics | median / pooled / quartiles / share-under-50% |
-| **D.3** WAPE by tier | one-row-per-tier table |
-| **D.4** Worst-forecast products | top-10 table |
-| **E.1** OOS rate by country | bar chart, top 15 |
-| **E.2** Inventory health (balance colors) | GREEN / AMBER / RED breakdown |
-| **E.3** Reorder-qty Pareto | cumulative-share line with 80% reference |
-
-Cells gracefully skip if upstream tables haven't been built yet, so the
-notebook can be run after just Bronze, after Silver, etc.
+Expect ~3,941 products with OOS rate 0.20–0.30.
 
 ---
 
@@ -308,7 +244,7 @@ Each defaults to **DRY-RUN** — set the widget `confirm = YES` to actually dele
 | `oos_rate` is 0% or 100% | `BALANCE_SIM_MULT_LOW/HIGH` mis-tuned | Tweak in `pipeline_config.py` |
 | `08_push_to_azure_sql` PK violation | Duplicate `(stock_code, observation_date)` rows | The notebook auto-dedupes; `02_compute_history` normalizes `StockCode` upstream |
 | `08_push_to_azure_sql` hangs | Azure SQL firewall blocks Databricks | Portal → SQL server → Networking → tick "Allow Azure services" |
-| `Login failed for user` | Wrong password, or used `<user>@<server>` legacy syntax | Use just `oosadmin` for SQL auth |
+| `Login failed for user` | Wrong password, or used `<user>@<server>` legacy syntax | Use just the bare admin login (no `@server` suffix) for SQL auth |
 | Auto Loader re-ingests old files | Checkpoint deleted between runs | Don't delete `_checkpoints/`; otherwise `reset_bronze` to start clean |
 
 ---
