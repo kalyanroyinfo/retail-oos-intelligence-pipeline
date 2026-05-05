@@ -1,1268 +1,359 @@
-# Azure OOS Pipeline Portfolio — 7-Day Plan
+# Retail OOS Intelligence Pipeline
 
-**Goal:** Build a portfolio-ready Azure data engineering pipeline (Bronze → Silver → Gold → Serving) using a public retail dataset, modeled on a real OOS detection use case. Aligned with the **DP-203 Azure Data Engineer Associate** scope (no BI / Power BI).
-
-**Total time:** ~45–55 hrs over 7 days (~6–8 hrs/day)
-**Budget:** ~$5–10 in Azure costs (uses free credits)
-
-> **Just want to run the code?** See [`RUNBOOK.md`](./RUNBOOK.md) for the
-> step-by-step execute-and-verify guide (local + Databricks). The
-> [Testing](#testing) section below covers the SQL queries to confirm
-> each layer is healthy.
+End-to-end Azure data engineering pipeline for retail Out-of-Stock (OOS)
+detection. Built on the medallion architecture (Bronze → Silver → Gold)
+with Unity Catalog on Databricks.
 
 ---
 
-## Repo Name Options
+## Project overview
 
-**Enterprise/technical tone:**
-- `retail-oos-forecasting-pipeline`
-- `inventory-intelligence-pipeline`
-- `demand-forecast-delta-lakehouse`
+The pipeline ingests daily retail transaction files, computes per-product
+sales history + tier classification + a forecast model, runs a
+walk-forward backtest, simulates current inventory, and writes a final
+KPI table that flags Out-of-Stock products and recommends reorder
+quantities.
 
-**Azure-stack focused:**
-- `azure-retail-oos-detection` ✅ *(recommended)*
-- `azure-lakehouse-forecasting`
-- `azure-medallion-ml-pipeline`
+Key model components (built per-product, ~3,941 products):
 
----
+- **Day-of-week median** of daily sales as the seasonal baseline
+- **OLS trend slope** over the last 45 days, projected to today
+- **Monthly lift factor** for current calendar-month seasonality
+- **Walk-forward backtest** on the last 7 days, computing WAPE per product
+- **Self-updating bias correction** clipped to `[0.5, 3.0]`
 
-## Architecture Overview
+The output (`oos_portfolio.gold.oos_agent_kpi`) gives a buyer:
+`is_oos`, `corrected_forecast`, `oos_threshold`, `reorder_qty`,
+`balance_color` (GREEN / AMBER / RED), and per-product `wape`.
 
-```
-UCI Online Retail CSV (split into daily files)
-        ↓
-   ADLS Gen2 landing zone — registered as Unity Catalog External Location
-        ↓
-   Auto Loader (cloudFiles) — incremental file ingestion with checkpoint
-        ↓
-   Unity Catalog: oos_portfolio.bronze.sales              (Delta managed table)
-        ↓
-   Unity Catalog: oos_portfolio.silver.{history, agent_stats, forecast,
-                                        forecast_accuracy, balance_snapshot}
-        ↓
-   Unity Catalog: oos_portfolio.gold.oos_agent_kpi
-        ↓
-   Azure SQL Database (serving layer — read by any downstream BI/app)
+## Dataset
 
-Orchestration: Azure Data Factory — daily trigger 06:00 UTC
-```
+**UCI Online Retail** — <https://archive.ics.uci.edu/dataset/352/online+retail>
 
-## Unity Catalog Object Hierarchy
+- ~500,000 transactional rows over ~305 days
+- ~3,941 unique products (`StockCode`)
+- 38 countries
+- Currency: GBP (`£`)
+- License: CC BY 4.0
 
-```
-oos_portfolio                           ← CATALOG  (top-level namespace)
-├── raw                                 ← SCHEMA   (landing zone)
-│   └── landing_zone                    ← VOLUME   (raw CSVs, files, models)
-├── bronze                              ← SCHEMA
-│   └── sales                           ← Delta TABLE (Auto Loader target)
-├── silver                              ← SCHEMA
-│   ├── oos_history
-│   ├── agent_stats
-│   ├── oos_forecast
-│   ├── oos_forecast_accuracy
-│   └── oos_balance_snapshot
-└── gold                                ← SCHEMA
-    └── oos_agent_kpi
-```
+The static CSV is split per `InvoiceDate` into ~305 daily files locally,
+then drip-fed into the landing zone to demonstrate Auto Loader's
+incremental ingestion (3 separate runs across separate "buckets" of files).
 
-> ⚠️ **Use Databricks Free Trial on Azure (14 days)** — *not* Community Edition.
-> Community Edition does **NOT** support Unity Catalog or Auto Loader.
+See `MAPPING.md` for the source-to-domain column mapping.
 
 ---
 
-## Incremental Loading Strategy (3-day drip-feed)
+## Azure features used
 
-UCI Online Retail is a **static historical dataset**. To genuinely demonstrate
-Auto Loader's incremental ingestion, we **split the CSV by date** and drop new
-"daily" files over Day 2 / Day 3 / Day 4. The Auto Loader checkpoint will
-process only new files on each re-run.
-
-| Day | Action |
+| Service | Role in the pipeline |
 |---|---|
-| **Day 1** | Split CSV into ~300 daily files locally (one per `InvoiceDate`) |
-| **Day 2** | Upload **all-but-last-2-days** files to landing zone → first Auto Loader run (~300 files) |
-| **Day 3** | Drop **1 new daily file** into landing zone → re-run Auto Loader (only 1 file processed) |
-| **Day 4** | Drop **1 more daily file** → re-run → again only 1 new file processed |
-
-After Day 4 you have **3 real incremental runs** to screenshot for the README.
+| **Azure Data Lake Storage Gen 2** | Raw + medallion file storage; container `oos-portfolio` with hierarchical namespace |
+| **Access Connector for Azure Databricks** | Managed-identity bridge between Unity Catalog and ADLS (no keys) |
+| **Azure Databricks (Premium)** | Spark compute, Delta Lake, Unity Catalog, Auto Loader |
+| **Unity Catalog** | Catalog / schemas / external location / volume governance |
+| **Delta Lake** | Table format for all bronze / silver / gold tables |
+| **Auto Loader (`cloudFiles`)** | Incremental file ingestion with checkpoints |
+| **Azure SQL Database** | Serving layer — gold KPIs queryable via standard SQL |
+| **azcopy + SAS** | One-time bulk upload of historical CSVs into the landing zone |
+| *(Optional)* **Azure Data Factory** | Daily orchestration of the master notebook |
+| *(Optional)* **Log Analytics** | Pipeline run / failure observability via KQL |
+| *(Optional)* **Databricks Secret Scope** | Hides Azure SQL credentials at runtime |
 
 ---
 
-## Notebook Architecture & Master Orchestration
-
-### Notebook tree (final state)
-
-All notebooks live in your Databricks workspace under `/Workspace/Repos/<user>/azure-retail-oos-detection/notebooks/`. The same files live in your GitHub repo under `notebooks/`.
+## Architecture
 
 ```
-notebooks/
-├── 00_run_full_pipeline.py             ← MASTER orchestrator (daily ETL)
-│
-├── setup/                             ← ONE-TIME admin setup (Day 2)
-│   ├── 00_run_all_setup.py             ← runs setup notebooks in order
-│   ├── 01_storage_credential.sql       ← UC → ADLS managed-identity link
-│   ├── 02_external_location.sql        ← register oos-portfolio container
-│   ├── 03_catalog_schemas.sql          ← catalog + 4 medallion schemas
-│   ├── 04_volume.sql                   ← landing_zone external volume
-│   └── 05_grants.sql                   ← (optional) permissions
-│
-├── config/                            ← shared config used by all ETL nbs
-│   └── pipeline_config.py              ← paths, table names, thresholds
-│
-├── bronze/
-│   └── 01_ingest_bronze_autoloader.py
-├── silver/
-│   ├── 02_compute_history.py
-│   ├── 03_compute_agent_stats.py
-│   ├── 04_compute_forecast.py
-│   ├── 05_compute_backtest.py
-│   └── 06_compute_balance_snapshot.py
-├── gold/
-│   ├── 07_compute_kpis.py
-│   └── 08_push_to_azure_sql.py
-└── analysis/
-    └── Results_and_Analysis.ipynb      ← portfolio "proof of work" charts
+UCI CSV → ADLS Gen 2 (landing/) → Databricks Auto Loader
+                                    ↓
+                       Bronze: oos_portfolio.bronze.sales
+                                    ↓
+                       Silver: history → agent_stats → forecast
+                                    │
+                       Silver: backtest │ balance_snapshot
+                                    ↓
+                       Gold:   oos_portfolio.gold.oos_agent_kpi
+                                    ↓ (Spark JDBC)
+                       Azure SQL Database: dbo.oos_agent_kpi
 ```
 
-### What each notebook does
+Orchestration: Azure Data Factory (or Databricks Workflows / manual)
+trigger of `notebooks/00_run_full_pipeline.py`.
 
-#### A. One-time setup notebooks (`setup/`) — Day 2 only
-
-These run **once** per environment to provision Unity Catalog objects.
-Run in order; each requires the previous to succeed.
-
-| # | Notebook | Purpose | Privilege required |
-|---|---|---|---|
-| 01 | `setup/01_storage_credential.sql` | **Verify-only.** The storage credential `cred_oos_portfolio` is created manually via Catalog Explorer → External Data → Storage Credentials. This notebook just runs `DESCRIBE STORAGE CREDENTIAL …` and fails fast if it's missing. | **Metastore admin** (for the manual UI step) |
-| 02 | `setup/02_external_location.sql` | `CREATE EXTERNAL LOCATION ext_lakehouse` at the `oos-portfolio` container root + `VALIDATE` | **Metastore admin** |
-| 03 | `setup/03_catalog_schemas.sql` | `CREATE CATALOG oos_portfolio` + 4 schemas (`raw`, `bronze`, `silver`, `gold`) each with `MANAGED LOCATION` | Catalog creator |
-| 04 | `setup/04_volume.sql` | `CREATE EXTERNAL VOLUME oos_portfolio.raw.landing_zone` pointing at `landing/uci_retail/` | Schema owner |
-| 05 | `setup/05_grants.sql` | (Optional) `GRANT USE CATALOG`, `READ VOLUME`, `SELECT ON SCHEMA gold` to `account users` | Object owner |
-| 00 | `setup/00_run_all_setup.py` | Master setup runner — calls 01→05 sequentially via `dbutils.notebook.run` | Same as above |
-
-> ⚠️ **Run only once** — these are idempotent (`CREATE ... IF NOT EXISTS`) but should not be in the daily pipeline. ADF should NOT call them.
-
-#### B. Daily ETL notebooks (the actual pipeline)
-
-| # | Notebook | Layer | Purpose | Day built |
-|---|---|---|---|---|
-| 01 | `bronze/01_ingest_bronze_autoloader.py` | Bronze | Auto Loader: landing CSVs → `bronze.sales` Delta | Day 2 |
-| 02 | `silver/02_compute_history.py` | Silver | Daily sales aggregation per product | Day 3 |
-| 03 | `silver/03_compute_agent_stats.py` | Silver | Tier classification (T1/T2/T3) | Day 3 |
-| 04 | `silver/04_compute_forecast.py` | Silver | DOW + trend + monthly lift forecast | Day 3 |
-| 05 | `silver/05_compute_backtest.py` | Silver | Walk-forward backtest, WAPE, bias correction | Day 4 |
-| 06 | `silver/06_compute_balance_snapshot.py` | Silver | Simulated current balance per product | Day 4 |
-| 07 | `gold/07_compute_kpis.py` | Gold | Final OOS KPIs with corrected forecast | Day 5 |
-| 08 | `gold/08_push_to_azure_sql.py` | Gold | JDBC write to Azure SQL Database | Day 5 |
-| 00 | `00_run_full_pipeline.py` | Master | Orchestrates all 8 ETL notebooks in dependency order | Day 6 |
-
-#### C. Shared config + analysis
-
-| Notebook | Purpose | Day |
-|---|---|---|
-| `config/pipeline_config.py` | Centralized constants: catalog name, table FQNs, thresholds, JDBC URL | Day 2 |
-| `analysis/Results_and_Analysis.ipynb` | Portfolio charts: WAPE histogram, forecast vs actual, OOS rate | Day 7 |
-
-### Master setup runner — `setup/00_run_all_setup.py`
-
-Run this **once on Day 2** to provision all Unity Catalog objects. After it succeeds, you never run it again — daily ETL takes over.
-
-```python
-# notebooks/setup/00_run_all_setup.py
-# One-time UC setup runner — calls 5 SQL/Python steps in dependency order.
-# Idempotent: every step uses CREATE ... IF NOT EXISTS.
-
-from datetime import datetime
-
-def run_step(name, path, timeout=600):
-    print(f"▶ START {name}  ({datetime.utcnow().isoformat()})")
-    result = dbutils.notebook.run(path, timeout)
-    print(f"✔ END   {name}  → {result}")
-    return result
-
-# Strict dependency chain — DO NOT reorder
-run_step("storage_credential",  "./01_storage_credential")    # admin
-run_step("external_location",   "./02_external_location")     # admin (depends on #1)
-run_step("catalog_and_schemas", "./03_catalog_schemas")       # depends on #2
-run_step("landing_volume",      "./04_volume")                # depends on #3
-run_step("grants",              "./05_grants")                # optional
-
-dbutils.notebook.exit("UC setup complete")
-```
-
-> **Note:** SQL notebooks return strings via `dbutils.notebook.exit('...')` only in Python notebooks. For pure `.sql` files, the master runner just executes them and checks for absence of errors. Alternatively, wrap each SQL block in a `.py` notebook using `spark.sql("""...""")` if you want richer return values.
-
-### Shared config — `config/pipeline_config.py`
-
-Avoid hard-coding catalog names, table FQNs, or thresholds in every ETL notebook. Centralize them.
-
-> **Why these values?** The thresholds below are calibrated against actual UCI
-> Online Retail percentiles (median daily sales £14.22, p25 £7.50, p75 £26.86,
-> p95 £79, ~3,941 products, ~305 days). Earlier drafts ported numbers from a
-> Zambian mobile-money agent use case (ZMW currency, hourly granularity); those
-> values produced nonsensical OOS rates and tier splits on retail data.
-
-```python
-# notebooks/config/pipeline_config.py
-# Calibrated for UCI Online Retail (GBP, daily granularity, ~3,941 products)
-
-# ── Unity Catalog object names ───────────────────────────────────
-CATALOG = "oos_portfolio"
-RAW_SCHEMA    = f"{CATALOG}.raw"
-BRONZE_SCHEMA = f"{CATALOG}.bronze"
-SILVER_SCHEMA = f"{CATALOG}.silver"
-GOLD_SCHEMA   = f"{CATALOG}.gold"
-
-# Volume path (Auto Loader watches this)
-LANDING_VOLUME = f"/Volumes/{CATALOG}/raw/landing_zone"
-
-# ── Fully-qualified table names ──────────────────────────────────
-T_BRONZE_SALES        = f"{BRONZE_SCHEMA}.sales"
-T_SILVER_HISTORY      = f"{SILVER_SCHEMA}.oos_history"
-T_SILVER_AGENT_STATS  = f"{SILVER_SCHEMA}.agent_stats"
-T_SILVER_FORECAST     = f"{SILVER_SCHEMA}.oos_forecast"
-T_SILVER_ACCURACY     = f"{SILVER_SCHEMA}.oos_forecast_accuracy"
-T_SILVER_BALANCE      = f"{SILVER_SCHEMA}.oos_balance_snapshot"
-T_GOLD_KPI            = f"{GOLD_SCHEMA}.oos_agent_kpi"
-
-# ── OOS thresholds ───────────────────────────────────────────────
-OOS_THRESHOLD_FLOOR     = 5      # £ floor — ≈ p25 daily sales
-OOS_THRESHOLD_DAYS      = 1.0    # threshold = max(floor, forecast × this)
-TOPUP_BUFFER_DAYS       = 2.0    # restock target covers this many forecast days
-# (No OOS_THRESHOLD_REBAL — no rebalancer concept in retail)
-
-# ── Product tiers (DAILY revenue, not hourly) ────────────────────
-TIER_T1_MIN_DAILY       = 30     # £/day → ~22% T1
-TIER_T2_MIN_DAILY       = 8      # £/day → ~38% T2  (T3 = remainder ~40%)
-
-# ── Forecast scale-factor clip per tier ──────────────────────────
-SCALE_CLIP_T1           = (0.5, 5.0)   # T1: most volatile, widest clip
-SCALE_CLIP_T2           = (0.5, 3.0)
-SCALE_CLIP_T3           = (0.5, 1.5)   # T3: tight clip (low-volume noise)
-
-# ── Outlier handling ─────────────────────────────────────────────
-WINSORIZE_PCT           = 0.95   # p95 cap on extreme daily sales
-BIAS_CORRECTION_CLIP    = (0.5, 3.0)
-
-# ── Backtest ─────────────────────────────────────────────────────
-BACKTEST_DAYS           = 7
-TREND_WINDOW_DAYS       = 45     # UCI dataset is ~305 days; OK
-COLD_START_DAYS         = 7
-COLD_START_BUFFER       = 1.1
-
-# ── Balance simulation (UCI has no real inventory data) ──────────
-BALANCE_SIM_LOOKBACK    = 3      # days of recent sales to base "balance" on
-BALANCE_SIM_MULT_LOW    = 0.3
-BALANCE_SIM_MULT_HIGH   = 1.5    # → ~25% OOS rate
-BALANCE_SIM_SEED        = 42
-
-# ── Currency / display ───────────────────────────────────────────
-CURRENCY_SYMBOL         = "£"
-CURRENCY_CODE           = "GBP"
-```
-
-**Usage in any ETL notebook:**
-
-```python
-%run ../config/pipeline_config
-
-sdf_history = spark.table(T_SILVER_HISTORY)
-```
-
-The `%run` magic command imports all variables from the config notebook into the current scope — clean, no circular imports, version-controlled in one place.
-
-### Master notebook — `00_run_full_pipeline.py`
-
-This is the **single entry point** for the daily ETL. ADF will call this one notebook (instead of orchestrating 8 separate notebook activities), which simplifies the ADF pipeline and keeps orchestration logic in code where it can be version-controlled.
-
-```python
-# notebooks/00_run_full_pipeline.py
-# Master orchestrator — runs the full Bronze → Silver → Gold pipeline
-# in dependency order. Each child notebook is a self-contained step.
-
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
-
-# ── Pipeline parameters (override via ADF widgets) ───────────────
-dbutils.widgets.text("run_date",     str(datetime.utcnow().date()))
-dbutils.widgets.text("env",          "dev")
-dbutils.widgets.text("oos_threshold", "1.0")
-
-run_date      = dbutils.widgets.get("run_date")
-env           = dbutils.widgets.get("env")
-oos_threshold = dbutils.widgets.get("oos_threshold")
-
-common_params = {
-    "run_date":      run_date,
-    "env":           env,
-    "oos_threshold": oos_threshold,
-}
-
-# ── Helper: run a child notebook + log status ────────────────────
-def run_step(name, path, timeout=1800, params=None):
-    print(f"▶ START {name}  ({datetime.utcnow().isoformat()})")
-    result = dbutils.notebook.run(path, timeout, params or common_params)
-    print(f"✔ END   {name}  → {result}")
-    return result
-
-# ── STEP 1: Bronze (Auto Loader) ─────────────────────────────────
-run_step("bronze_autoloader", "./bronze/01_ingest_bronze_autoloader")
-
-# ── STEP 2: Silver — history must run first (forecast depends on it)
-run_step("silver_history",    "./silver/02_compute_history")
-
-# ── STEP 3: Silver — agent_stats + forecast can run in parallel
-with ThreadPoolExecutor(max_workers=2) as ex:
-    f_stats    = ex.submit(run_step, "silver_agent_stats", "./silver/03_compute_agent_stats")
-    f_forecast = ex.submit(run_step, "silver_forecast",    "./silver/04_compute_forecast")
-    f_stats.result(); f_forecast.result()
-
-# ── STEP 4: Silver — backtest depends on forecast; balance independent
-with ThreadPoolExecutor(max_workers=2) as ex:
-    f_back = ex.submit(run_step, "silver_backtest", "./silver/05_compute_backtest")
-    f_bal  = ex.submit(run_step, "silver_balance",  "./silver/06_compute_balance_snapshot")
-    f_back.result(); f_bal.result()
-
-# ── STEP 5: Gold KPIs (depends on all silver tables) ─────────────
-run_step("gold_kpis", "./gold/07_compute_kpis")
-
-# ── STEP 6: Push to Azure SQL Database (final serving layer) ─────
-run_step("push_azure_sql", "./gold/08_push_to_azure_sql")
-
-# ── Pipeline summary ─────────────────────────────────────────────
-dbutils.notebook.exit(f"SUCCESS run_date={run_date} env={env}")
-```
-
-### Execution DAG (what actually runs in what order)
-
-```
-                  01_bronze_autoloader
-                         │
-                  02_compute_history
-                  ┌──────┴──────┐
-                  ▼             ▼
-        03_agent_stats    04_compute_forecast
-                  └──────┬──────┘
-                  ┌──────┴──────┐
-                  ▼             ▼
-        05_compute_backtest   06_balance_snapshot
-                  └──────┬──────┘
-                         ▼
-                   07_compute_kpis
-                         │
-                         ▼
-                   08_push_to_azure_sql
-```
-
-### Two orchestration options (pick one for Day 6)
-
-**Option A — Master notebook only** (simplest)
-- ADF pipeline has **1 activity**: "Run `00_run_full_pipeline`"
-- Orchestration logic lives in Python (versioned, tested, portable)
-- **Use this for the portfolio** — cleanest demo
-
-**Option B — ADF orchestrates each notebook**
-- ADF pipeline has **8 chained activities**, one per notebook
-- Visual DAG inside ADF — recruiters can see the dependency graph
-- More clicks but visually impressive on screenshots
-- Requires re-creating dependencies in ADF JSON
-
-**Recommended:** build Option A first (works in 30 min). If time on Day 6 permits, *also* build Option B for the screenshot.
-
-### Why a master notebook (vs raw ADF)
-
-1. **Faster iteration** — change orchestration logic by editing 1 Python file, no ADF redeploy.
-2. **Local-runnable** — you can test the full pipeline by running `00_run_full_pipeline` directly in Databricks without ADF.
-3. **Parametric** — widgets let you pass `run_date`, `env`, `oos_threshold` at runtime.
-4. **Parallelism** — `ThreadPoolExecutor` runs independent notebooks concurrently; ADF can't do this without complex parallel-activity setup.
-5. **Portable** — same pattern works in Databricks Workflows, ADF, or Airflow.
-
-### Each child notebook follows this template
-
-```python
-# notebooks/silver/04_compute_forecast.py
-# DOW + trend + monthly-lift forecast
-
-# ── Widgets (so master + ADF can pass parameters) ────────────────
-dbutils.widgets.text("run_date", "")
-dbutils.widgets.text("env",      "dev")
-run_date = dbutils.widgets.get("run_date")
-
-# ── Read upstream Silver table ───────────────────────────────────
-sdf_history = spark.table("oos_portfolio.silver.oos_history")
-
-# ── Transform (forecast logic here) ──────────────────────────────
-sdf_forecast = (sdf_history
-    # ... DOW median + trend + monthly factor ...
-)
-
-# ── Write downstream Silver table ────────────────────────────────
-(sdf_forecast.write
-    .format("delta")
-    .mode("overwrite")
-    .saveAsTable("oos_portfolio.silver.oos_forecast"))
-
-# ── Return value (visible in master orchestrator logs) ───────────
-dbutils.notebook.exit(f"forecast rows={sdf_forecast.count()} run_date={run_date}")
-```
-
-This template — widgets → read → transform → write → exit — keeps every child notebook **idempotent, parameterized, and self-contained**.
+Full diagram and resource names: `ARCHITECTURE.md`.
 
 ---
 
-# DAY 1 — Foundation: Azure + GitHub + Bronze Upload
-
-**Time: 7–8 hrs**
-
-## Morning (3 hrs) — Accounts & Setup
-
-- [ ] Create Azure free account ($200 credit) — sign up the night before; approval can take 1–4 hrs
-- [ ] Sign up for Databricks Community Edition (free, no credit card)
-- [ ] Install Azure CLI + Databricks CLI locally
-  ```bash
-  brew install azure-cli
-  pip install databricks-cli
-  az login
-  ```
-- [ ] Create GitHub repo `azure-retail-oos-detection` with this folder structure:
-  ```
-  azure-retail-oos-detection/
-  ├── README.md
-  ├── ARCHITECTURE.md
-  ├── MAPPING.md
-  ├── requirements.txt
-  ├── infrastructure/
-  ├── etl/
-  │   ├── bronze/
-  │   ├── silver/
-  │   └── gold/
-  ├── notebooks/
-  ├── docs/
-  └── tests/
-  ```
-- [ ] Write initial `README.md` with problem statement
-- [ ] Create Azure Resource Group:
-  ```bash
-  az group create --name rg-oos-portfolio --location eastus
-  ```
-
-## Afternoon (3 hrs) — Storage + Raw Data
-
-- [ ] Create ADLS Gen2 storage account (enable hierarchical namespace)
-- [ ] Create **1 container**: `oos-portfolio`
-  - Industry standard for UC-governed setups: a single container holds all
-    layers as folders, governance happens at UC layer (not container RBAC)
-  - **Azure naming rule:** container names allow only lowercase letters,
-    digits, and hyphens — **NO underscores**. So the container is
-    `oos-portfolio` (hyphens), while UC catalog/schema names use
-    `oos_portfolio` (underscores, since UC identifiers prefer underscores).
-  - Folder layout inside `oos-portfolio/`:
-    ```
-    oos-portfolio/
-    ├── landing/uci_retail/      ← raw CSVs (UC volume)
-    ├── bronze/                  ← UC managed schema location
-    ├── silver/                  ← UC managed schema location
-    └── gold/                    ← UC managed schema location
-    ```
-- [ ] Download UCI Online Retail dataset:
-  - Source: https://archive.ics.uci.edu/dataset/352/online+retail
-  - Format: Excel (.xlsx)
-- [ ] Convert Excel → CSV locally
-- [ ] **Split the CSV into daily files** for the drip-feed strategy:
-  ```python
-  # split_by_date.py — run once locally
-  import pandas as pd, os
-  df = pd.read_csv("online_retail.csv", parse_dates=["InvoiceDate"])
-  df["sale_date"] = df["InvoiceDate"].dt.date
-  os.makedirs("daily_files", exist_ok=True)
-  for d, group in df.groupby("sale_date"):
-      group.drop(columns=["sale_date"]).to_csv(
-          f"daily_files/online_retail_{d}.csv", index=False
-      )
-  print(f"Created {df['sale_date'].nunique()} daily files")
-  ```
-- [ ] Stage the daily files into 3 buckets locally:
-  - **Bucket A** (historical) — all dates except last 2
-  - **Bucket B** — second-to-last date (1 file)
-  - **Bucket C** — last date (1 file)
-
-## Evening (1–2 hrs) — Data Understanding
-
-- [ ] Open dataset in Pandas locally; document:
-  - Columns: `InvoiceNo, StockCode, Description, Quantity, InvoiceDate, UnitPrice, CustomerID, Country`
-  - Row count, date range, null counts, unique products
-- [ ] Write `MAPPING.md`:
-  - `StockCode` → `agent_id`
-  - `daily revenue (Quantity × UnitPrice)` → `total_sales`
-  - `Country` → `region`
-  - `InvoiceDate` → `tbl_dt` (partition column)
-- [ ] Define OOS rule for retail context:
-  - `is_oos = current_stock < forecast_daily_sales × 1.0`
-- [ ] Commit everything to GitHub
-
-**End of Day 1 deliverable:** GitHub repo live, daily files split locally,
-ADLS landing container ready, schema mapping documented.
-
----
-
-# DAY 2 — Unity Catalog Setup + Auto Loader Bronze Ingestion
-
-**Time: 7–8 hrs**
-
-## Morning Part A (1.5 hrs) — Databricks Workspace + Cluster
-
-- [ ] Spin up **Databricks Free Trial on Azure** workspace (NOT Community Edition)
-- [ ] Create a cluster:
-  - Runtime: **13.3 LTS or higher** (UC + Auto Loader require this)
-  - Access mode: **Single user** or **Shared** (both UC-enabled)
-  - Node type: smallest available (Standard_DS3_v2 is fine)
-
-## Morning Part B (1.5 hrs) — Unity Catalog: Storage Credential + External Location
-
-UC needs a way to access ADLS. This is a **one-time setup**.
-
-- [ ] Create an **Azure Databricks Access Connector** (managed identity):
-  ```bash
-  az databricks access-connector create \
-    --resource-group rg-oos-portfolio \
-    --name ac-oos-portfolio \
-    --location eastus \
-    --identity-type SystemAssigned
-  ```
-- [ ] Get the connector's principal ID:
-  ```bash
-  az databricks access-connector show \
-    --resource-group rg-oos-portfolio \
-    --name ac-oos-portfolio --query identity.principalId -o tsv
-  ```
-- [ ] Grant it **Storage Blob Data Contributor** on your ADLS account:
-  ```bash
-  az role assignment create \
-    --assignee <principal_id> \
-    --role "Storage Blob Data Contributor" \
-    --scope /subscriptions/<sub>/resourceGroups/rg-oos-portfolio/providers/Microsoft.Storage/storageAccounts/<storage>
-  ```
-- [ ] Create Storage Credential + External Location — pick **either** Option A (UI) **or** Option B (SQL). Both produce the same result. After this completes, continue to **Part C** to create catalog → schemas → volume.
-
-### Option A — Databricks UI (point-and-click)
-
-In Databricks → **Catalog Explorer** → **External Data**:
-  1. **Storage Credentials** → Create:
-     - Name: `cred-oos-portfolio`
-     - Type: Azure Managed Identity
-     - Access Connector ID: paste **resource ID** from Azure portal
-       (format: `/subscriptions/<sub>/resourceGroups/rg-oos-portfolio/providers/Microsoft.Databricks/accessConnectors/ac-oos-portfolio`)
-  2. **External Locations** → Create **ONE** location at the container root
-     (covers all sub-folders: landing, bronze, silver, gold):
-     - Name: `ext-lakehouse`
-     - URL: `abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/`
-     - Storage credential: `cred-oos-portfolio`
-  3. Click **Test connection** — must pass before proceeding.
-
-### Option B — SQL (run in a Databricks SQL editor or notebook)
-
-> ⚠️ **Privilege required:** you must be a **metastore admin** to run `CREATE STORAGE CREDENTIAL` and `CREATE EXTERNAL LOCATION`. Account admins can grant this via Account Console → Metastores.
-
-```sql
--- ──────────────────────────────────────────────────────────────────
--- 1. Create the storage credential (links UC to the Access Connector)
--- ──────────────────────────────────────────────────────────────────
--- Replace <sub>, resource group, and connector name with your actual values.
--- The full resource ID can be copied from the Access Connector's Azure
--- portal "Properties" page → "Resource ID".
-
-CREATE STORAGE CREDENTIAL cred_oos_portfolio
-  WITH AZURE_MANAGED_IDENTITY
-       '/subscriptions/<sub>/resourceGroups/rg-oos-portfolio/providers/Microsoft.Databricks/accessConnectors/ac-oos-portfolio'
-  COMMENT 'Managed identity used by UC to access the lakehouse container';
-
--- Verify
-SHOW STORAGE CREDENTIALS;
-DESCRIBE STORAGE CREDENTIAL cred_oos_portfolio;
-
-
--- ──────────────────────────────────────────────────────────────────
--- 2. Create the external location at the container root
--- ──────────────────────────────────────────────────────────────────
--- One location covers all sub-folders (landing/, bronze/, silver/, gold/).
--- Schemas and volumes created later will inherit access through this.
-
-CREATE EXTERNAL LOCATION ext_lakehouse
-  URL 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/'
-  WITH (STORAGE CREDENTIAL cred_oos_portfolio)
-  COMMENT 'Root external location for OOS lakehouse (all medallion layers)';
-
--- Verify path is reachable + permissions are correct
--- (equivalent to clicking "Test connection" in the UI)
-VALIDATE EXTERNAL LOCATION ext_lakehouse;
-
--- Inspect
-SHOW EXTERNAL LOCATIONS;
-DESCRIBE EXTERNAL LOCATION ext_lakehouse;
-
-
--- ──────────────────────────────────────────────────────────────────
--- 3. (Optional) Grant your user/group access to use this location
--- ──────────────────────────────────────────────────────────────────
--- Needed if you want a non-admin to create schemas/tables under it.
-
-GRANT CREATE EXTERNAL TABLE  ON EXTERNAL LOCATION ext_lakehouse TO `account users`;
-GRANT CREATE MANAGED STORAGE ON EXTERNAL LOCATION ext_lakehouse TO `account users`;
-GRANT READ FILES             ON EXTERNAL LOCATION ext_lakehouse TO `account users`;
-GRANT WRITE FILES            ON EXTERNAL LOCATION ext_lakehouse TO `account users`;
-```
-
-> 💡 **Tip:** if `VALIDATE EXTERNAL LOCATION` fails, the most common cause is the RBAC role (Storage Blob Data Contributor) hasn't propagated yet — wait 2–5 minutes and re-run.
-
-## Morning Part C (1 hr) — Create Catalog, Schemas, Volume (full SQL)
-
-Run all of this in a Databricks SQL editor or notebook **after** Part B SQL
-has succeeded. Replace `<storage_account>` with your actual ADLS account name.
-
-> 💡 **Pattern:** one external location at the container root (Part B), then each
-> schema gets its own MANAGED LOCATION pointing to a sub-folder. UC
-> automatically writes managed tables under that location.
-
-### Full UC setup dependency chain (Part B → Part C)
-
-The complete bottom-up order — each step depends on the previous:
+## Project structure
 
 ```
-1. CREATE STORAGE CREDENTIAL cred_oos_portfolio        ← Part B
-        ↓ (consumed by)
-2. CREATE EXTERNAL LOCATION ext_lakehouse              ← Part B
-        ↓ (parent path of all schemas + volumes below)
-3. CREATE CATALOG oos_portfolio                        ← Part C below
-        ↓
-4. CREATE SCHEMA oos_portfolio.raw     (MANAGED LOCATION → /landing/)
-5. CREATE SCHEMA oos_portfolio.bronze  (MANAGED LOCATION → /bronze/)
-6. CREATE SCHEMA oos_portfolio.silver  (MANAGED LOCATION → /silver/)
-7. CREATE SCHEMA oos_portfolio.gold    (MANAGED LOCATION → /gold/)
-        ↓
-8. CREATE EXTERNAL VOLUME oos_portfolio.raw.landing_zone
-   (LOCATION → /landing/uci_retail/)
+retail-oos-intelligence-pipeline/
+├── README.md                         ← this file
+├── ARCHITECTURE.md                   ← architecture diagram + resource names
+├── MAPPING.md                        ← UCI → domain column mapping
+├── infrastructure/README.md          ← Azure provisioning walkthrough
+├── notebooks/
+│   ├── 00_run_full_pipeline.py       ← master orchestrator
+│   ├── setup/                        ← one-time UC provisioning (5 SQL files + runner)
+│   ├── config/pipeline_config.py     ← shared constants
+│   ├── bronze/01_ingest_bronze_autoloader.py
+│   ├── silver/02_compute_history.py
+│   ├── silver/03_compute_agent_stats.py
+│   ├── silver/04_compute_forecast.py        ← OLS trend + DOW + monthly lift
+│   ├── silver/05_compute_backtest.py        ← walk-forward, WAPE, bias correction
+│   ├── silver/06_compute_balance_snapshot.py
+│   ├── gold/07_compute_kpis.py
+│   ├── gold/08_push_to_azure_sql.py         ← serving-layer JDBC write
+│   ├── maintenance/                  ← reset_bronze / reset_silver_gold / reset_all
+│   └── analysis/Results_and_Analysis.ipynb  ← portfolio "proof of work" charts
+├── scripts/split_by_date.py          ← split CSV into daily files
+└── tests/test_forecast.py            ← local unit tests for the forecast math
 ```
 
-Run steps 3–8 below as one block:
-
-```sql
--- ──────────────────────────────────────────────────────────────────
--- STEP 1: Create the catalog (top-level namespace)
--- ──────────────────────────────────────────────────────────────────
--- MANAGED LOCATION is required on newer Databricks accounts (no default
--- metastore storage root). Pointing at the container root lets each
--- schema's own MANAGED LOCATION nest underneath it.
-CREATE CATALOG IF NOT EXISTS oos_portfolio
-  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/'
-  COMMENT 'Portfolio project: retail OOS detection pipeline (medallion architecture)';
-
--- Set as default for this session
-USE CATALOG oos_portfolio;
-
--- Verify
-SHOW CATALOGS;
-DESCRIBE CATALOG EXTENDED oos_portfolio;
-
-
--- ──────────────────────────────────────────────────────────────────
--- STEP 2: Create schemas with MANAGED LOCATIONS (one per medallion layer)
--- ──────────────────────────────────────────────────────────────────
--- Each schema's managed location is a sub-folder of the lakehouse container.
--- All managed tables created in a schema land under its managed location.
-
-CREATE SCHEMA IF NOT EXISTS oos_portfolio.raw
-  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/landing/'
-  COMMENT 'Landing zone: raw incoming files via Auto Loader';
-
-CREATE SCHEMA IF NOT EXISTS oos_portfolio.bronze
-  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/bronze/'
-  COMMENT 'Bronze layer: ingested raw Delta tables';
-
-CREATE SCHEMA IF NOT EXISTS oos_portfolio.silver
-  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/silver/'
-  COMMENT 'Silver layer: cleaned + feature-engineered tables';
-
-CREATE SCHEMA IF NOT EXISTS oos_portfolio.gold
-  MANAGED LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/gold/'
-  COMMENT 'Gold layer: business KPI tables';
-
--- Verify
-SHOW SCHEMAS IN oos_portfolio;
-DESCRIBE SCHEMA EXTENDED oos_portfolio.bronze;
-
-
--- ──────────────────────────────────────────────────────────────────
--- STEP 3: Create the volume (governed folder for non-tabular files)
--- ──────────────────────────────────────────────────────────────────
--- The volume is where Auto Loader watches for new CSVs. Volumes are
--- the UC-native way to manage files (CSVs, models, images, etc.).
-
-CREATE EXTERNAL VOLUME IF NOT EXISTS oos_portfolio.raw.landing_zone
-  LOCATION 'abfss://oos-portfolio@<storage_account>.dfs.core.windows.net/landing/uci_retail/'
-  COMMENT 'Daily incoming UCI Online Retail CSV files';
-
--- Verify
-SHOW VOLUMES IN oos_portfolio.raw;
-DESCRIBE VOLUME oos_portfolio.raw.landing_zone;
-
-
--- ──────────────────────────────────────────────────────────────────
--- STEP 4: (Optional) Grant permissions for portfolio demo
--- ──────────────────────────────────────────────────────────────────
--- For a solo portfolio you can skip this. For a multi-user demo:
-
--- Allow all account users to use the catalog and read everything
-GRANT USE CATALOG          ON CATALOG  oos_portfolio TO `account users`;
-GRANT USE SCHEMA           ON SCHEMA   oos_portfolio.bronze TO `account users`;
-GRANT USE SCHEMA           ON SCHEMA   oos_portfolio.silver TO `account users`;
-GRANT USE SCHEMA           ON SCHEMA   oos_portfolio.gold   TO `account users`;
-GRANT SELECT               ON SCHEMA   oos_portfolio.gold   TO `account users`;
-GRANT READ VOLUME          ON VOLUME   oos_portfolio.raw.landing_zone TO `account users`;
-
-
--- ──────────────────────────────────────────────────────────────────
--- STEP 5: Sanity checks
--- ──────────────────────────────────────────────────────────────────
-SHOW EXTERNAL LOCATIONS;        -- should show ext-lakehouse
-SHOW STORAGE CREDENTIALS;       -- should show cred-oos-portfolio
-SHOW CATALOGS;                  -- should show oos_portfolio
-SHOW SCHEMAS IN oos_portfolio;  -- raw, bronze, silver, gold
-SHOW VOLUMES IN oos_portfolio.raw;  -- landing_zone
-```
-
-After this runs, files in the volume are accessible at:
-`/Volumes/oos_portfolio/raw/landing_zone/`
-
-And managed tables created later (e.g. `oos_portfolio.bronze.sales`) will
-auto-land under `abfss://lakehouse@.../bronze/sales/`.
-
-## Afternoon Part A (1 hr) — Upload Bucket A Files (initial historical load)
-
-- [ ] Use Databricks CLI to upload **Bucket A** files (all-but-last-2-days):
-  ```bash
-  for f in daily_files_bucketA/*.csv; do
-    databricks fs cp "$f" \
-      dbfs:/Volumes/oos_portfolio/raw/landing_zone/
-  done
-  ```
-- [ ] Verify in Catalog Explorer → `oos_portfolio.raw.landing_zone` → ~300 files
-
-## Afternoon Part B (3 hrs) — Auto Loader Bronze Ingestion Job
-
-- [ ] Write `etl/bronze/ingest_bronze_autoloader.py`:
-  ```python
-  from pyspark.sql import functions as F
-  from pyspark.sql.types import (StructType, StructField, StringType,
-                                  IntegerType, DoubleType, TimestampType)
-
-  schema = StructType([
-      StructField("InvoiceNo",   StringType(),    True),
-      StructField("StockCode",   StringType(),    True),
-      StructField("Description", StringType(),    True),
-      StructField("Quantity",    IntegerType(),   True),
-      StructField("InvoiceDate", TimestampType(), True),
-      StructField("UnitPrice",   DoubleType(),    True),
-      StructField("CustomerID",  StringType(),    True),
-      StructField("Country",     StringType(),    True),
-  ])
-
-  VOLUME      = "/Volumes/oos_portfolio/raw/landing_zone"
-  CHECKPOINT  = f"{VOLUME}/_checkpoints/bronze_sales"
-  SCHEMA_LOC  = f"{VOLUME}/_schemas/bronze_sales"
-
-  bronze_stream = (
-      spark.readStream
-          .format("cloudFiles")
-          .option("cloudFiles.format", "csv")
-          .option("cloudFiles.schemaLocation", SCHEMA_LOC)
-          .option("header", "true")
-          .schema(schema)
-          .load(VOLUME)
-          .withColumn("tbl_dt",      F.to_date("InvoiceDate"))
-          .withColumn("ingested_at", F.current_timestamp())
-          .withColumn("source_file", F.col("_metadata.file_path"))
-  )
-
-  (bronze_stream.writeStream
-      .format("delta")
-      .option("checkpointLocation", CHECKPOINT)
-      .option("mergeSchema", "true")
-      .partitionBy("tbl_dt")
-      .trigger(availableNow=True)        # batch-style: process all new, then exit
-      .toTable("oos_portfolio.bronze.sales"))
-  ```
-- [ ] Run the script in Databricks → first run processes ~300 files
-- [ ] Verify with SQL:
-  ```sql
-  SELECT tbl_dt, COUNT(*) row_count,
-         COUNT(DISTINCT source_file) file_count,
-         MAX(ingested_at) latest_ingestion
-  FROM oos_portfolio.bronze.sales
-  GROUP BY tbl_dt ORDER BY tbl_dt DESC;
-  ```
-- [ ] Take screenshot — this is your **proof of incremental ingestion run #1**
-- [ ] Commit script to GitHub
-
-**End of Day 2 deliverable:** Unity Catalog live, Auto Loader Bronze table
-populated with ~300 days of historical data.
-
 ---
 
-# DAY 3 — Incremental Run #2 + Silver Layer: History + Tier + Forecast
-
-**Time: 7–8 hrs** ⚠️ *Heaviest day — start early*
-
-## Pre-morning (15 min) — Incremental Drop #1
-
-- [ ] Upload **Bucket B** file (1 new day's CSV) to the volume:
-  ```bash
-  databricks fs cp daily_files_bucketB/online_retail_<date>.csv \
-    dbfs:/Volumes/oos_portfolio/raw/landing_zone/
-  ```
-- [ ] Re-run `ingest_bronze_autoloader.py` → checkpoint detects only the new file
-- [ ] Verify: row count for new `tbl_dt` partition appears, others unchanged
-- [ ] Screenshot — **proof of incremental ingestion run #2**
-
-## Morning (3 hrs) — Daily Sales History
-
-- [ ] Write `etl/silver/compute_history.py`:
-  - Read `oos_portfolio.bronze.sales`
-  - Aggregate per product per day: `groupBy(StockCode, tbl_dt).agg(F.sum(Quantity * UnitPrice).alias("daily_sales"))`
-  - Write to `oos_portfolio.silver.oos_history` as **Delta** managed table
-- [ ] Verify: distinct products, date range, no duplicates
-
-## Midday (2 hrs) — Tier Classification
-
-- [ ] Write `etl/silver/compute_agent_stats.py`:
-  - Compute `avg_daily_sales` per `StockCode` over full history
-  - Assign tier (uses `TIER_T1_MIN_DAILY` / `TIER_T2_MIN_DAILY` from config):
-    - **T1-Gold**: avg_daily_sales ≥ £30
-    - **T2-Silver**: £8 ≤ avg_daily_sales < £30
-    - **T3-Bronze**: avg_daily_sales < £8
-  - Thresholds are calibrated against UCI percentiles (median £14.22 / p25 £7.50 / p75 £26.86)
-  - Write to `oos_portfolio.silver.agent_stats` Delta
-- [ ] Print tier distribution; expect ~22% T1, ~38% T2, ~40% T3
-
-## Afternoon (3 hrs) — Forecast Model
-
-- [ ] Write `etl/silver/compute_forecast.py`:
-  - **DOW median**: `groupBy(StockCode, day_of_week).agg(F.expr("percentile_approx(daily_sales, 0.5)"))`
-  - **45-day OLS trend** per product via Spark SQL aggregates (no UDF, no window):
-    - `slope = covar_pop(days_ago, daily_sales) / var_pop(days_ago)`
-    - `projected_today = trend_avg − slope × avg(days_ago)`  (exact OLS intercept at days_ago=0)
-    - `trend_factor = clip(projected_today / overall_median, per-tier ranges)`
-    - Products with <2 distinct days → NULL slope → fall back to `trend_factor = 1.0`
-  - **Monthly lift factor**: current month median / overall median
-  - **Forecast formula**: `forecast = max(dow_median × trend_factor × month_factor, 0)`
-  - Write to `oos_portfolio.silver.oos_forecast` Delta
-- [ ] Spot-check 5 products manually
-
-**End of Day 3 deliverable:** Incremental run #2 done; history + tiers + forecast running and validated.
-
----
-
-# DAY 4 — Incremental Run #3 + Backtest + Balance Simulation
-
-**Time: 6–7 hrs**
-
-## Pre-morning (15 min) — Incremental Drop #2
-
-- [ ] Upload **Bucket C** file (final daily CSV) to the volume:
-  ```bash
-  databricks fs cp daily_files_bucketC/online_retail_<date>.csv \
-    dbfs:/Volumes/oos_portfolio/raw/landing_zone/
-  ```
-- [ ] Re-run `ingest_bronze_autoloader.py` → only the new file is processed
-- [ ] Verify with the same SQL as Day 2 — only the new `tbl_dt` partition has a new `latest_ingestion`
-- [ ] Screenshot — **proof of incremental ingestion run #3**
-- [ ] You now have 3 incremental runs documented for the README
-
-## Morning (3 hrs) — Walk-forward Backtest
-
-- [ ] Write `etl/silver/compute_backtest.py`:
-  - Hold out last 7 days as test set
-  - For each test day, forecast using only prior data
-  - Compute per product:
-    - **WAPE** = `sum(|actual - forecast|) / sum(actual)`
-    - **bias_correction** = `sum(actual) / sum(forecast)`, clipped to `[0.5, 3.0]`
-  - Write to `oos_portfolio.silver.oos_forecast_accuracy` Delta
-- [ ] Document results in notebook:
-  - Median WAPE
-  - % products with WAPE < 50%
-  - Distribution of bias correction values
-
-## Afternoon (3–4 hrs) — Balance Snapshot Simulation
-
-- [ ] Write `etl/silver/compute_balance_snapshot.py`:
-  - UCI dataset has no real-time inventory balance — simulate it
-  - For each product:
-    - `current_balance = (sum of last 3 days sales) × random_uniform(0.3, 1.5)`
-  - This deliberately creates ~20–30% OOS rate so the gold KPIs have meaningful variation
-  - Set seed for reproducibility
-  - Write to `oos_portfolio.silver.oos_balance_snapshot` Delta
-
-**End of Day 4 deliverable:** 3 incremental runs documented; backtest accuracy + simulated balance snapshot ready.
-
----
-
-# DAY 5 — Gold Layer + Azure SQL Database
-
-**Time: 7–8 hrs**
-
-## Morning (3 hrs) — Gold KPI Computation
-
-- [ ] Write `etl/gold/compute_kpis.py`:
-  - Join: `balance_snapshot ⨝ forecast ⨝ accuracy ⨝ agent_stats`
-  - Apply bias correction: `corrected_forecast = forecast × bias_correction`
-  - Compute KPIs:
-    - `oos_threshold = max(OOS_THRESHOLD_FLOOR, corrected_forecast × OOS_THRESHOLD_DAYS)`
-      (i.e. `max(£5, corrected_forecast × 1.0)` — £5 ≈ p25 daily sales)
-    - `is_oos = current_balance < oos_threshold`
-    - `reorder_qty = ceil(max(corrected_forecast × 2.0 - current_balance, 0))`
-      (units to add so on-hand covers `TOPUP_BUFFER_DAYS` of forecast demand)
-    - `balance_color` (rough bands — balance ≈ ~3 days of sales):
-      - GREEN: `current_balance ≥ £80`
-      - AMBER: `£25 ≤ current_balance < £80`
-      - RED: `current_balance < £25`
-  - Write to `oos_portfolio.gold.oos_agent_kpi` Delta
-- [ ] Verify: OOS rate (~20–30%), tier breakdown, threshold distribution sensible
-
-## Afternoon (4 hrs) — Azure SQL Database + Push
-
-- [ ] Create **Azure SQL Database** (Basic tier — ~$5/month, cheapest):
-  ```bash
-  az sql server create \
-    --resource-group rg-oos-portfolio \
-    --name oos-sql-server \
-    --location eastus \
-    --admin-user oosadmin \
-    --admin-password '<strong-password>'
-
-  az sql db create \
-    --resource-group rg-oos-portfolio \
-    --server oos-sql-server \
-    --name oos_portfolio \
-    --service-objective Basic
-  ```
-- [ ] Configure firewall — Portal → SQL server → Networking:
-  - ✅ **"Allow Azure services and resources to access this server"** (lets Databricks reach it)
-  - **+ Add current client IP** for local connections
-- [ ] Create the table (T-SQL — note `BIT` instead of `BOOLEAN`):
-  ```sql
-  USE oos_portfolio;
-
-  CREATE TABLE dbo.oos_agent_kpi (
-      stock_code         VARCHAR(20)  NOT NULL,
-      country            VARCHAR(50),
-      tier               VARCHAR(15),
-      current_balance    DECIMAL(12,2),
-      corrected_forecast DECIMAL(12,2),
-      oos_threshold      DECIMAL(12,2),
-      is_oos             BIT,
-      reorder_qty        DECIMAL(12,2),
-      balance_color      VARCHAR(10),
-      wape               DECIMAL(5,2),
-      observation_date   DATE         NOT NULL,
-      CONSTRAINT pk_oos_agent_kpi PRIMARY KEY (stock_code, observation_date)
-  );
-  CREATE INDEX idx_oos_country ON dbo.oos_agent_kpi(country);
-  CREATE INDEX idx_oos_tier    ON dbo.oos_agent_kpi(tier);
-  ```
-- [ ] **JDBC driver** is already bundled with Databricks Runtime — no Maven library install needed.
-- [ ] Write `notebooks/gold/08_push_to_azure_sql.py` using Spark JDBC:
-  ```python
-  df.write.format("jdbc") \
-      .option("url", "jdbc:sqlserver://<host>:1433;database=oos_portfolio;encrypt=true;trustServerCertificate=false") \
-      .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver") \
-      .option("dbtable", "dbo.oos_agent_kpi") \
-      .option("user", user).option("password", pwd) \
-      .mode("overwrite").save()
-  ```
-- [ ] Verify data in Azure Data Studio, SSMS, DBeaver, or `sqlcmd`
-
-**End of Day 5 deliverable:** Gold KPIs in Azure SQL Database, queryable.
-
----
-
-# DAY 6 — Orchestration + Monitoring
-
-**Time: 7–8 hrs**
-
-## Morning (3–4 hrs) — Azure Data Factory Pipeline
-
-- [ ] Create ADF instance in same resource group
-- [ ] Create linked services: ADLS Gen2, Databricks, Azure SQL Database
-- [ ] Build pipeline with **Databricks Notebook activities** chained:
-  ```
-  bronze_autoloader (Auto Loader, trigger=availableNow)
-      ↓
-  silver_history
-      ↓
-  silver_forecast  ──┐
-                     ├──→  silver_balance
-  silver_backtest  ──┘
-      ↓
-  gold_kpis
-      ↓
-  push_azure_sql
-  ```
-- [ ] Configure daily trigger at 06:00 UTC
-- [ ] Trigger a manual test run end-to-end
-- [ ] Add email failure alert via ADF monitoring → Alerts
-
-> 💡 **If ADF blocks you for >2 hrs:** Fall back to **Databricks Workflows** — native, simpler, same result on resume.
-
-## Afternoon (3–4 hrs) — Monitoring & validation queries
-
-These are the data-engineering-side observability tasks — equivalent of "did
-last night's job land what we expected?" SQL playbooks.
-
-- [ ] Create an **Azure Monitor Log Analytics workspace** in the same resource group
-- [ ] Wire ADF to send pipeline-run logs to Log Analytics (ADF → Diagnostic settings → "Send to Log Analytics workspace")
-- [ ] Wire Databricks workspace diagnostic logs (Databricks → Diagnostic settings → "Send to Log Analytics")
-- [ ] Save 3 KQL queries in the Log Analytics workspace:
-  - last 24 h pipeline runs by status
-  - average notebook runtime per step
-  - failure stack-trace excerpts for the last failed run
-- [ ] Save the SQL validation queries from `RUNBOOK.md → Testing` into the Azure SQL **Query Store** (or just commit them under `docs/sql_checks/`):
-  - row-count delta vs gold table
-  - duplicate-PK detector
-  - null/threshold sanity checks
-
-**End of Day 6 deliverable:** Automated daily pipeline + observability + post-run validation queries committed.
-
----
-
-# DAY 7 — Polish, Documentation & Publish
-
-**Time: 6–7 hrs**
-
-## Morning (3 hrs) — Documentation
-
-- [ ] Create architecture diagram in [Excalidraw](https://excalidraw.com) (fastest):
-  - UCI CSV → ADLS Bronze → Databricks (Bronze→Silver→Gold) → Azure SQL
-  - Show ADF orchestration layer + Log Analytics
-- [ ] Write `ARCHITECTURE.md` with the diagram embedded
-- [ ] Update `README.md` with:
-  - **Problem statement** (3–4 sentences — why OOS detection matters in retail)
-  - **Architecture diagram** (embedded image)
-  - **Tech stack badges**: Azure, Databricks, Delta Lake, Python 3.10, Azure SQL, Azure Data Factory, Log Analytics
-  - **Results section**:
-    - Median WAPE: e.g., 32%
-    - OOS detection rate: e.g., 78%
-    - Tier distribution: T1 18% / T2 31% / T3 51%
-    - Bias-correction impact: e.g., reduced systematic under-forecast by 28%
-    - Auto Loader incremental-ingestion proof (3 screenshots)
-  - **How to run** (5-step quickstart)
-  - **Cost breakdown**: ~$5–10 total
-
-## Midday (2 hrs) — Results Notebook
-
-- [ ] Write `notebooks/Results_and_Analysis.ipynb`:
-  - WAPE histogram across all products
-  - Forecast vs actual line chart for 3 sample products (one per tier)
-  - OOS rate over time (last 30 days)
-  - Bias-correction impact: forecast before/after correction
-- [ ] This is your **proof of work** — recruiters open this first
-
-## Afternoon (1–2 hrs) — Publish
-
-- [ ] Make repo **public**
-- [ ] Add `requirements.txt`:
-  ```
-  pyspark==3.4.1
-  delta-spark==2.4.0
-  pandas
-  numpy
-  scikit-learn
-  matplotlib
-  ```
-- [ ] Add 1 simple unit test in `tests/test_forecast.py`:
-  - Test DOW median calculation with known input
-- [ ] Final commit + push to main
-- [ ] Add project to CV under "Projects":
-  > **Azure Retail OOS Detection Pipeline** — End-to-end medallion-architecture data pipeline (Bronze/Silver/Gold) using Azure Data Factory, Databricks (PySpark), Delta Lake, Unity Catalog, Auto Loader, ADLS Gen2, and Azure SQL Database; forecast model with walk-forward backtesting (WAPE) and self-updating bias correction; serving-layer KPIs queryable via standard SQL.
-- [ ] *(Optional, do tomorrow — not Day 7)* Draft LinkedIn post
-
-**End of Day 7 deliverable:** Public GitHub repo + live ETL pipeline + CV entry. ✅
-
----
-
-## Testing
-
-How to verify each layer is healthy. Run these in order — earlier failures cascade.
-
-### 1. Local unit tests (no Databricks needed)
-
-The forecast math has a few invariants we can pin down with pure Python:
+## Quick start
 
 ```bash
+# 1. Clone + local sanity tests
+git clone <repo-url> retail-oos-intelligence-pipeline
+cd retail-oos-intelligence-pipeline
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+pytest tests/ -v
+
+# 2. Split UCI CSV into daily files (one-time)
+python scripts/split_by_date.py --src online_retail.csv --out daily_files
+
+# 3. Upload to ADLS via azcopy (see infrastructure/README.md Step 11)
+azcopy copy "daily_files/*.csv" \
+  "https://oosstorage.blob.core.windows.net/oos-portfolio/landing/uci_retail/${SAS}"
+```
+
+Then in Databricks:
+
+```python
+# 4. Run the master orchestrator — Bronze through Gold + Azure SQL push
+dbutils.notebook.run("./notebooks/00_run_full_pipeline", 1800)
+```
+
+---
+
+## How to run — phase by phase
+
+### Phase 1 — Local prep
+
+**Unit tests:**
+
+```bash
 pytest tests/ -v
 ```
 
-`tests/test_forecast.py` covers DOW-median behaviour, the OOS-threshold floor,
-and the bias-correction clip. Three checks, all should pass in <1s.
+Three checks (DOW median, OOS-threshold floor, bias-correction clip) pass in <1s.
 
-### 2. Per-stage validation on Databricks
+**Split the UCI CSV:**
 
-After running each notebook, paste these into a SQL cell. Expected ranges
-are calibrated for UCI Online Retail.
+Prereq: download `online_retail.xlsx` from
+<https://archive.ics.uci.edu/dataset/352/online+retail>, convert to CSV,
+place at repo root as `online_retail.csv`.
 
-**Bronze — `01_ingest_bronze_autoloader`**
+```bash
+python scripts/split_by_date.py --src online_retail.csv --out daily_files
+```
+
+Optionally split into 3 buckets to demo Auto Loader's incremental ingestion (3 separate runs):
+
+```bash
+mkdir -p daily_files_bucketA daily_files_bucketB daily_files_bucketC
+ls daily_files | sort | head -n -2 | xargs -I{} mv daily_files/{} daily_files_bucketA/
+ls daily_files | sort | head -n 1   | xargs -I{} mv daily_files/{} daily_files_bucketB/
+mv daily_files/* daily_files_bucketC/
+```
+
+### Phase 2 — Azure infrastructure (one-time)
+
+Follow `infrastructure/README.md` for the full Portal walkthrough — 11 steps:
+
+1. Resource Group `rg-oos-portfolio`
+2. Access Connector for Databricks `ac-oos-portfolio`
+3. Storage Account `oosstorage` (HNS enabled) + container `oos-portfolio`
+4. RBAC: `Storage Blob Data Contributor` → Access Connector
+5. Databricks workspace `dbw-oos-portfolio` (**Premium tier**)
+6. Cluster (and optional SQL warehouse)
+7. Storage Credential `cred_oos_portfolio` in Unity Catalog
+8. External Location `ext_lakehouse`
+9. Catalog + schemas + volume (`notebooks/setup/00_run_all_setup.py`)
+10. Azure SQL Database `oos_portfolio` + `dbo.oos_agent_kpi` table
+11. Upload historical CSVs via `azcopy` + SAS
+
+### Phase 3 — Run the pipeline
+
+**Master orchestrator (recommended):**
+
+```python
+dbutils.notebook.run("./notebooks/00_run_full_pipeline", 1800)
+```
+
+Bronze → Silver (with parallel branches) → Gold → Azure SQL push.
+Total runtime: ~5–8 min.
+
+**Or run notebooks individually:**
+
+| Order | Notebook | Approx. runtime |
+|---|---|---|
+| 1 | `bronze/01_ingest_bronze_autoloader` | 30–90 s |
+| 2 | `silver/02_compute_history` | 30 s |
+| 3 | `silver/03_compute_agent_stats` | 20 s |
+| 4 | `silver/04_compute_forecast` | 60 s |
+| 5 | `silver/05_compute_backtest` | 60 s |
+| 6 | `silver/06_compute_balance_snapshot` | 20 s |
+| 7 | `gold/07_compute_kpis` | 30 s |
+| 8 | `gold/08_push_to_azure_sql` | 60–120 s |
+
+### Phase 4 — Verify
+
+Sanity SQL — paste into any Databricks SQL cell:
+
 ```sql
-SELECT tbl_dt, COUNT(*) AS rows,
-       COUNT(DISTINCT source_file) AS files,
-       MAX(ingested_at) AS latest_ingestion
+-- Bronze: row counts + ingestion timestamps
+SELECT tbl_dt, COUNT(*) AS rows, MAX(ingested_at) AS latest_ingestion
 FROM oos_portfolio.bronze.sales
 GROUP BY tbl_dt ORDER BY tbl_dt DESC LIMIT 10;
-```
-Expect: one row per day; `latest_ingestion` advances only on partitions touched
-by the current run (this is the proof of incremental ingestion).
 
-**Silver — history (`02_compute_history`)**
-```sql
-SELECT COUNT(*) AS rows, COUNT(DISTINCT StockCode) AS products,
-       MIN(tbl_dt) AS first_dt, MAX(tbl_dt) AS last_dt
-FROM oos_portfolio.silver.oos_history;
-```
-Expect: ~3,941 products, ~305 days.
+-- Silver: tier distribution should be ~22 / 38 / 40
+SELECT tier, COUNT(*) AS n FROM oos_portfolio.silver.agent_stats GROUP BY tier ORDER BY tier;
 
-**Silver — agent_stats (`03_compute_agent_stats`)** — tier distribution
-```sql
-SELECT tier, COUNT(*) AS n,
-       ROUND(AVG(avg_daily_sales), 2) AS avg_£
-FROM oos_portfolio.silver.agent_stats
-GROUP BY tier ORDER BY tier;
-```
-Expect roughly **T1 ~22% / T2 ~38% / T3 ~40%**. Wildly different splits ⇒
-`TIER_T*_MIN_DAILY` thresholds in `pipeline_config.py` need re-tuning.
-
-**Silver — forecast (`04_compute_forecast`)** — trend factor sanity
-```sql
-SELECT tier,
-       percentile_approx(trend_factor, array(0.1, 0.5, 0.9)) AS p10_p50_p90,
-       SUM(CASE WHEN trend_factor = 1.0 THEN 1 ELSE 0 END) AS n_fallback,
-       COUNT(*) AS n_rows
-FROM oos_portfolio.silver.oos_forecast
-GROUP BY tier ORDER BY tier;
-```
-Expect: p50 close to 1.0; T3 has the most `n_fallback=1.0` rows (sparse
-products with <2 distinct active days fall back via NULL slope).
-
-**Silver — backtest (`05_compute_backtest`)** — accuracy
-```sql
-SELECT percentile_approx(wape, array(0.25, 0.5, 0.75)) AS wape_quartiles,
-       AVG(CAST((wape < 0.5) AS INT))                  AS pct_under_50,
-       COUNT(*)                                        AS n_products
+-- Silver: forecast accuracy
+SELECT percentile_approx(wape, array(0.25, 0.5, 0.75)) AS quartiles,
+       AVG(CAST((wape < 0.5) AS INT))                  AS pct_under_50
 FROM oos_portfolio.silver.oos_forecast_accuracy;
-```
-Expect: median WAPE in 0.3–0.6 (UCI is volatile); ≥50% of products under 50% WAPE.
 
-**Gold — KPIs (`07_compute_kpis`)** — headline OOS metrics
-```sql
+-- Gold: headline KPIs
 SELECT COUNT(*)                                            AS n_products,
        SUM(CASE WHEN is_oos THEN 1 ELSE 0 END)             AS n_oos,
        ROUND(AVG(CASE WHEN is_oos THEN 1.0 ELSE 0.0 END), 3) AS oos_rate,
        SUM(reorder_qty)                                    AS total_reorder_qty
 FROM oos_portfolio.gold.oos_agent_kpi;
 ```
-Expect: `oos_rate` ~0.20–0.30 (driven by `BALANCE_SIM_MULT_LOW/HIGH = 0.3 / 1.5`).
-If it's near 0 or near 1, the simulation multiplier is mis-tuned.
 
-**Azure SQL — push (`08_push_to_azure_sql`)**
+Then in Azure SQL Query editor:
+
 ```sql
 SELECT COUNT(*), MAX(observation_date) FROM oos_portfolio.dbo.oos_agent_kpi;
-SELECT TOP 10 * FROM oos_portfolio.dbo.oos_agent_kpi WHERE is_oos = 1;
-```
-Row count must equal the gold table; if it's smaller, JDBC silently dropped
-rows (usually a firewall hiccup — re-check "Allow Azure services" is on).
-
-### 3. End-to-end smoke test
-
-Run the master orchestrator from a notebook cell:
-
-```python
-dbutils.notebook.run(
-    "./00_run_full_pipeline", 1800,
-    {"run_date": "2026-05-03", "env": "dev"}
-)
 ```
 
-Healthy run prints `START … / END … -> …` for all eight steps and exits
-with `SUCCESS run_date=… env=dev`.
+Row count should match `oos_portfolio.gold.oos_agent_kpi` on Databricks.
 
-### 4. Auto Loader incremental-ingestion proof
+Expected ranges (UCI dataset): ~3,941 products, OOS rate 0.20–0.30, median WAPE 0.30–0.60.
 
-This is the screenshot recruiters look for. After each daily-file drop:
+### Phase 5 — Generate analysis charts
 
-```sql
-SELECT tbl_dt, COUNT(*) AS rows, MAX(ingested_at) AS latest_ingestion
-FROM oos_portfolio.bronze.sales
-GROUP BY tbl_dt ORDER BY tbl_dt DESC;
-```
+The portfolio "proof of work" notebook lives at
+`notebooks/analysis/Results_and_Analysis.ipynb` — 11 charts / tables across
+5 sections (data overview, tier story, forecast methodology, forecast
+accuracy, OOS outcomes).
 
-Only the **new** `tbl_dt` should have a newer `latest_ingestion`. If older
-partitions also re-ingest, the checkpoint is mis-configured (most often the
-`_checkpoints` folder was deleted between runs).
+To run:
 
----
+1. Open the notebook in Databricks
+2. Attach to your cluster
+3. **Run all**
 
-## Daily Time Budget Summary
+Sections produced:
 
-| Day | Focus | Est. Hours | Critical Path Risk |
-|---|---|---|---|
-| 1 | Setup + CSV split + landing zone | 7–8 | Azure account approval (1–4 hrs) |
-| 2 | UC catalog/schema/volume + Auto Loader Bronze | **7–8** | Storage credential / external location config |
-| 3 | Incremental run #2 + Silver: history + tier + forecast | **7–8** | Heaviest day — start early |
-| 4 | Incremental run #3 + Backtest + balance simulation | 6–7 | — |
-| 5 | Gold KPIs + Azure SQL | 7–8 | Azure SQL firewall config |
-| 6 | ADF orchestration + Log Analytics | 7–8 | ADF first-time learning curve |
-| 7 | Docs + publish | 6–7 | Buffer for spillover |
-
-**Total: ~48–54 hours**
-
----
-
-## Critical Risks & Mitigations
-
-| Risk | Mitigation |
+| Section | Output |
 |---|---|
-| Azure account approval delay | Sign up the night before Day 1 |
-| Community Edition lacks UC + Auto Loader | Use **Databricks Free Trial on Azure** (14 days, full features) |
-| Storage credential test fails | Confirm RBAC role propagated (~5 min); use Access Connector managed identity, not SP keys |
-| Auto Loader checkpoint corruption on re-runs | Never delete `_checkpoints` folder mid-test — clears file-tracking state |
-| SQL Server JDBC issues | The driver is bundled with DBR 13.x+ — no install needed; if you hit class-not-found, you're on an unsupported runtime |
-| ADF learning curve | If stuck >2 hrs, use **Databricks Workflows** instead |
-| Forecast WAPE looks bad | UCI dataset is volatile; document honestly + show bias correction improvement |
+| **A.1** Data shape card | rows / products / date range / countries |
+| **A.2** Daily revenue over time | line chart |
+| **B.1** Tier composition + revenue Pareto | grouped bar (% products vs % revenue) |
+| **C.1** Day-of-week seasonality | bar chart per DOW |
+| **C.2** Trend factor distribution per tier | 3-pane histogram |
+| **D.1** WAPE histogram | overall accuracy distribution |
+| **D.2** WAPE summary metrics | median / pooled / quartiles / share-under-50% |
+| **D.3** WAPE by tier | one-row-per-tier table |
+| **D.4** Worst-forecast products | top-10 table |
+| **E.1** OOS rate by country | bar chart, top 15 |
+| **E.2** Inventory health (balance colors) | GREEN / AMBER / RED breakdown |
+| **E.3** Reorder-qty Pareto | cumulative-share line with 80% reference |
+
+Cells gracefully skip if upstream tables haven't been built yet, so the
+notebook can be run after just Bronze, after Silver, etc.
 
 ---
 
-## What Was Cut From the Original 20-Day Plan
+## Resets — start a layer over
 
-| Cut | Reason |
+`notebooks/maintenance/` contains 3 dry-run-by-default reset scripts:
+
+| Notebook | Wipes | Keeps |
+|---|---|---|
+| `reset_bronze.py` | Landing volume contents + Bronze table | Silver, Gold |
+| `reset_silver_gold.py` | All Silver + Gold tables | Bronze, landing |
+| `reset_all.py` | Everything above (chains both) | Setup objects |
+
+Each defaults to **DRY-RUN** — set the widget `confirm = YES` to actually delete.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `VALIDATE EXTERNAL LOCATION` fails | RBAC propagation delay | Wait 2–5 min, retry |
+| `CREATE CATALOG` fails: "Metastore storage root URL does not exist" | Newer Databricks account | Already handled — `03_catalog_schemas.sql` sets explicit `MANAGED LOCATION` |
+| Bronze produces 0 rows | Files missing in volume, or checkpoint already saw them | `LIST '/Volumes/oos_portfolio/raw/landing_zone/'`; if needed run `reset_bronze` |
+| Tier distribution wildly off | Threshold mismatch with currency/granularity | Check `TIER_T*_MIN_DAILY` in `pipeline_config.py` |
+| `trend_factor = 1.0` for everyone | Trend filter too aggressive | Inspect `sdf_trend` after `.filter(isNotNull)` in `04_compute_forecast` |
+| `oos_rate` is 0% or 100% | `BALANCE_SIM_MULT_LOW/HIGH` mis-tuned | Tweak in `pipeline_config.py` |
+| `08_push_to_azure_sql` PK violation | Duplicate `(stock_code, observation_date)` rows | The notebook auto-dedupes; `02_compute_history` normalizes `StockCode` upstream |
+| `08_push_to_azure_sql` hangs | Azure SQL firewall blocks Databricks | Portal → SQL server → Networking → tick "Allow Azure services" |
+| `Login failed for user` | Wrong password, or used `<user>@<server>` legacy syntax | Use just `oosadmin` for SQL auth |
+| Auto Loader re-ingests old files | Checkpoint deleted between runs | Don't delete `_checkpoints/`; otherwise `reset_bronze` to start clean |
+
+---
+
+## Cost
+
+Cheapest-tier Azure resources, all running:
+
+| Resource | Approx. monthly cost |
 |---|---|
-| Bicep/Terraform IaC | Nice-to-have, not critical for resume credibility |
-| GitHub Actions CI | Adds polish but doesn't change the project's substance |
-| LinkedIn article on Day 18 | Better written *after* a week of using the project |
-| Power BI / dashboards layer | Out of scope for DP-203 (data engineer cert). Dashboards = PL-300 territory. |
-| Cost optimization deep-dive | Mention briefly in README; not a Day's worth of work |
-| Multiple unit tests | One representative test is enough for portfolio context |
+| Storage account (LRS, ~50 MB) | < $0.10 |
+| Access connector | $0 |
+| Databricks workspace | $0 idle; cluster at ~$0.40–0.80/hr while running |
+| Azure SQL (Basic, 5 DTU) | ~$5 |
+| **Total when actively iterating** | **~$5–10/month** |
+
+Pause the SQL DB and stop the cluster between sessions to minimize.
 
 ---
 
-## Resume Bullet (after completion)
+## What this project demonstrates
 
-> Architected an **end-to-end Azure data pipeline** (ADF, Databricks PySpark, **Unity Catalog**, **Auto Loader**, Delta Lake, ADLS Gen2, Azure SQL) implementing **medallion architecture** (Bronze→Silver→Gold) for retail stock-out detection across 4,000+ products; ingested incremental daily files via `cloudFiles` with checkpoint-based file tracking; engineered a **DOW + trend + monthly-lift forecast model** with **walk-forward backtesting** (WAPE) and **self-updating bias correction**; serving-layer KPIs surfaced via JDBC to Azure SQL Database, with Log Analytics observability and ADF daily orchestration.
+- **Medallion architecture** with Unity Catalog governance
+- **Incremental ingestion** via Auto Loader checkpoints (3 documented runs)
+- **Spark SQL aggregates** for time-series analytics — `covar_pop`,
+  `var_pop`, `percentile_approx`, window functions
+- **Data quality discipline** — `StockCode` whitespace/case normalization
+  in silver to satisfy a downstream relational PK constraint
+- **Walk-forward backtesting** with WAPE + self-updating bias correction
+- **Idempotent ETL** — every notebook uses overwrite mode, master
+  orchestrator can rerun safely
+- **Defensive operational design** — reset notebooks for each layer,
+  table-availability guards in the analysis notebook
+- **Serving-layer integration** via Spark JDBC to Azure SQL
+- **Observability hooks** — Log Analytics + KQL queries for ADF /
+  Databricks diagnostic logs
+- **Manual provisioning playbook** — every Azure resource documented
+  in `infrastructure/README.md` for repeatability
 
 ---
 
-## Quick Daily Checklist (print this)
+## References
 
-- [ ] **Day 1** — Azure + GitHub + CSV split into daily files + landing zone live
-- [ ] **Day 2** — UC catalog/schema/volume + Auto Loader Bronze (run #1)
-- [ ] **Day 3** — Incremental run #2 + Silver: history + tiers + forecast
-- [ ] **Day 4** — Incremental run #3 + Backtest (WAPE) + simulated balance
-- [ ] **Day 5** — Gold KPIs + Azure SQL serving
-- [ ] **Day 6** — ADF pipeline + Log Analytics monitoring
-- [ ] **Day 7** — Docs + public repo + CV updated
+- [`infrastructure/README.md`](infrastructure/README.md) — Azure setup, step by step
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — diagram + resource names
+- [`MAPPING.md`](MAPPING.md) — source-to-domain column mapping
+- [`notebooks/maintenance/README.md`](notebooks/maintenance/README.md) — reset scripts
+- [UCI Online Retail dataset](https://archive.ics.uci.edu/dataset/352/online+retail)

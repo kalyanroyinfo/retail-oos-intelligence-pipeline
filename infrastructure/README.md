@@ -331,7 +331,156 @@ The server's **Overview** page shows:
 oos-sql-server.database.windows.net    ← AZSQL_HOST
 ```
 
-Paste it into `notebooks/config/pipeline_config.py` (`AZSQL_HOST`), or store user/password in a Databricks secret scope (see RUNBOOK § 2.3).
+Paste it into `notebooks/config/pipeline_config.py` (`AZSQL_HOST`), or store user/password in a Databricks secret scope (paste the same values via `databricks secrets put-secret oos azsql_user` / `azsql_password`).
+
+---
+
+## Step 11 — Upload historical data via azcopy
+
+Auto Loader watches the landing volume but the volume starts empty.
+Use [`azcopy`](https://learn.microsoft.com/azure/storage/common/storage-use-azcopy-v10)
+to push the daily-split CSVs from your laptop into the
+`oos-portfolio` container's `landing/uci_retail/` folder.  This is a
+one-time operation per data refresh.
+
+Two pieces:
+1. Generate a **container-scoped SAS token** so azcopy can write without
+   needing the account key.
+2. Run azcopy with the token.
+
+### Step 11a — Generate the SAS token
+
+A SAS (Shared Access Signature) is a time-limited, scoped URL signature.
+Container-scoped (`sr=c`) lets you upload many files with one token.
+Blob-scoped (`sr=b`) only works for one file — don't use that.
+
+#### Option A — Azure Portal
+
+Portal → storage account `oosstorage` → **Containers** → click `oos-portfolio` →
+**Shared access tokens** (left nav of the container blade):
+
+| Field | Value |
+|---|---|
+| Signing method | **Account key** |
+| Signing key | **Key 1** |
+| Stored access policy | None |
+| **Permissions** | tick **Read, Add, Create, Write, Delete, List** *(`racwdl`)* |
+| Start | now |
+| Expiry | a few hours / days from now (longer = more risk if leaked) |
+| Allowed protocols | **HTTPS only** |
+
+Click **Generate SAS token and URL** → copy the **Blob SAS token** (the
+query string starting with `?sv=…`).  Don't copy the URL above it — just
+the token.
+
+#### Option B — Azure CLI
+
+```bash
+az storage container generate-sas \
+  --account-name oosstorage \
+  --name oos-portfolio \
+  --permissions racwdl \
+  --expiry 2026-05-08T23:59:00Z \
+  --https-only \
+  --auth-mode login --as-user \
+  --output tsv
+```
+
+The CLI prints just the token (no leading `?`).  Prepend `?` when storing.
+
+⚠️ **Treat the SAS token like a password** — anyone with it can write to
+your container until it expires.  Don't commit it to git, don't paste it
+into chat / Slack.
+
+### Step 11b — Run azcopy
+
+Install once on macOS:
+```bash
+brew install azcopy
+azcopy --version
+```
+
+Set the SAS as a shell variable so `&` characters don't trip the shell.
+Single quotes preserve the literal string:
+
+```bash
+# Paste the SAS you generated in Step 11a between the single quotes.
+# Format (do NOT use these placeholder values verbatim — generate your own):
+SAS='?sp=racwdl&st=<START-UTC>&se=<EXPIRY-UTC>&spr=https&sv=<API-VERSION>&sr=c&sig=<SIGNATURE>'
+```
+
+#### One-file smoke test
+
+Quick sanity check before the bulk upload — verifies SAS, network, and
+target path are all correct:
+
+```bash
+azcopy copy "daily_files_bucketA/online_retail_2025-04-23.csv" \
+  "https://oosstorage.blob.core.windows.net/oos-portfolio/landing/uci_retail/online_retail_2025-04-23.csv${SAS}"
+```
+
+Look for `Final Job Status: Completed` and `Total Number of Transfers: 1`.
+
+#### Bulk upload (all CSVs from a folder)
+
+The wildcard goes on the **source side**; the target URL ends with a `/`
+so azcopy preserves the source filenames:
+
+```bash
+cd daily_files_bucketA
+azcopy copy "*.csv" \
+  "https://oosstorage.blob.core.windows.net/oos-portfolio/landing/uci_retail/${SAS}"
+```
+
+For ~300 files (~50 MB total) this completes in 10–20 seconds — azcopy
+parallelises ~10 transfers at a time.  Expected output:
+
+```
+Number of File Transfers: 303
+Number of File Transfers Completed: 303
+Number of File Transfers Failed: 0
+Final Job Status: Completed
+```
+
+### Step 11c — Verify the upload
+
+Three places you can confirm the same files:
+
+```bash
+# Via azcopy
+azcopy list \
+  "https://oosstorage.blob.core.windows.net/oos-portfolio/landing/uci_retail/${SAS}" \
+  | wc -l
+```
+
+```sql
+-- In a Databricks SQL cell (the volume is the UC view of the same path)
+LIST '/Volumes/oos_portfolio/raw/landing_zone/'
+```
+
+```
+-- In Azure Portal: Storage → oos-portfolio → browse to landing/uci_retail/
+```
+
+All three should report the same file count.
+
+> 📝 **Endpoint note** — azcopy uses `oosstorage.blob.core.windows.net`
+> while Databricks's UC external location uses `oosstorage.dfs.core.windows.net`.
+> Both endpoints reach the same backing storage on a hierarchical-namespace
+> account, so files written via blob endpoint are immediately visible
+> through the dfs endpoint and vice versa.
+
+### Common azcopy pitfalls
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `AuthenticationFailed: Server failed to authenticate the request` | SAS expired | Regenerate (Step 11a) and re-export `SAS` |
+| `403 AuthorizationPermissionMismatch` | SAS missing `w` (write) or `c` (create) | Regenerate with `--permissions racwdl` |
+| `AuthorizationResourceTypeMismatch` | Used a blob-scoped SAS (`sr=b`) for bulk upload | Generate container-scoped (`sr=c`) instead |
+| Bulk upload created `…/landing/uci_retail/daily_files_bucketA/…` | Source path was the folder, not `*.csv` | Use `daily_files_bucketA/*.csv` (wildcard expands shell-side) |
+| `Failed: connection refused` | Storage firewall blocks public access | Step 3 left it default-open; if you tightened it, add your client IP |
+| Files uploaded but Auto Loader doesn't ingest them | Same filename re-uploaded; Auto Loader's checkpoint remembers it by path+size+mtime | Either rename files or wipe `_checkpoints/bronze_sales/` (see `notebooks/maintenance/reset_bronze.py`) |
+| `&` characters in SAS get interpreted by the shell | SAS not quoted | Wrap in single quotes when assigning the variable |
 
 ---
 
